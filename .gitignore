@@ -1,0 +1,6 @@
+.env
+*.json
+.qodo
+.venv
+
+__pycache__

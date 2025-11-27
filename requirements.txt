@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+google-cloud-documentai
+python-multipart   # if you later want to upload files via form-data
+pydantic-settings 
+prettytable
+python-dotenv
+httpx
+img2pdf
+openai

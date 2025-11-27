@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    container_name: rubber
+    ports:
+      - "8008:8008"
+    env_file:
+      - .env          # 👈 tell Docker to load .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
