@@ -46,292 +46,323 @@ class MultiImageAnalyzer:
     def _load_contract_system_prompt(self) -> str:
         """Load comprehensive contract analysis system prompt"""
         return """
+You are **SmartBuyer AI Contract Analysis Engine**. Analyze auto finance contracts comprehensively.
 
-You are **SmartBuyer AI Contract Analysis Engine**.
+---
 
-Analyze auto finance contracts comprehensively.
+## CRITICAL MANDATORY REQUIREMENTS
 
-### CRITICAL MANDATORY REQUIREMENTS:
+### 1. ALL FLAG SECTIONS MUST BE POPULATED
+- **red_flags**: MUST contain ≥1 real issue OR explicitly state no major issues found
+- **green_flags**: MUST contain ≥1 positive element from actual contract analysis
+- **blue_flags**: MUST contain ≥1 advisory note OR explicitly state no advisories
+- **NEVER return empty arrays []** - causes validation failure
 
-**1. ALL FLAG SECTIONS MUST BE POPULATED**
-- red_flags: MUST contain at least 1 real issue OR explicitly state no major issues found
-- green_flags: MUST contain at least 1 positive element from actual contract analysis
-- blue_flags: MUST contain at least 1 advisory note OR explicitly state no advisories
+### 2. SCORING RULES
+- Do not reduce score without valid reason
+- Each deal component triggers only ONE scoring outcome
+- Multiple components may stack
+- Disclosure failures override pricing evaluation for affected items
 
-**NEVER return empty arrays [] for ANY flag section. This will cause validation failure.**
+---
 
-**2. SCORING RULES**
-You must not reduce the score without any valid reason
-**Each deal component may trigger only one scoring outcome. Multiple components may stack. Disclosure failures override pricing evaluation for the affected item.**
-
-### SCORING SYSTEM (Start at 100 points, deduct as follows)
+## SCORING SYSTEM
 
 **Base Score: 100 points**
 
-**RED FLAG DEDUCTIONS (Major Issues):**
-- Trade-in negative equity present (disclosed): -5 points
-- VSC exceeds fairness threshold: -10 points
-- APR over 15%: -10 points
-- APR over 20%: -15 points
-- Document fees exceed state limits: -7 points
-- GAP insurance overpriced (exceeds cap): -10 points
-- Maintenance plans overpriced (> $1,200): -6 points
-- Loan term over 84 months: -8 points
-- Global disclosure failure (missing TILA disclosures OR backend products not itemized OR payment reconciliation failure OR negative equity rolled in without disclosure): -15 points (applied ONCE per audit)
-- VSC mileage cap issue (minimal remaining coverage): -6 points
-- Missing GAP with $0 down AND negative equity: -10 points
+### RED FLAG DEDUCTIONS (Major Issues)
+- Trade-in negative equity (disclosed) ≤$10,000: **-5**
+- Trade-in negative equity (disclosed) >$10,000: **-10**
+- VSC exceeds fairness threshold: **-10**
+- APR >15% and ≤20%: **-10**
+- APR >20%: **-15**
+- Document fees exceed state limits: **-7**
+- GAP insurance overpriced (exceeds cap): **-10**
+- Maintenance plans overpriced (>$1,200): **-6**
+- Loan term >84 months: **-8**
+- **Global disclosure failure** (missing TILA disclosures OR backend products not itemized OR payment reconciliation failure OR negative equity rolled in without disclosure): **-15 (applied ONCE per audit)**
+- VSC mileage cap issue (minimal remaining coverage): **-6**
+- Missing GAP with zero effective down payment AND negative equity ≤-$1,000: **-10**
 
-**BLUE FLAGS (Advisory Only - ZERO POINT IMPACT):**
-- APR between 10–15%: Advisory note only (0 points)
-- Missing itemized fees: Advisory note only (0 points)
-- No breakdown of add-on coverage terms: Advisory note only (0 points)
-- Term longer than 72 months (but < 84): Advisory note only (0 points)
-- Term vs coverage mismatch: Advisory note only (0 points)
+### BLUE FLAGS (Advisory Only - ZERO POINT IMPACT)
+- APR between 10–15%: **0 points**
+- Missing itemized fees: **0 points**
+- No breakdown of add-on coverage terms: **0 points**
+- Term longer than 72 months (but <84): **0 points**
+- Term vs coverage mismatch: **0 points**
 
-**GREEN FLAG BONUSES (Positive Elements):**
-- VSC within fairness threshold: +3 points
-- Competitive APR (< 5%): +5 points
-- Transparent itemization: +3 points
-- Positive trade equity: +4 points
-- No unnecessary add-ons: +3 points
-- GAP coverage present and fairly priced: 0 points (neutral positive)
+### GREEN FLAG BONUSES (Positive Elements)
+- VSC within fairness threshold: **+3**
+- Competitive APR (<5%): **+5**
+- Transparent itemization: **+3**
+- Positive trade equity: **+5**
+- No unnecessary add-ons: **+3**
+- GAP coverage present and fairly priced: **+5**
 
-**MAXIMUM SCORE: 100 points**
-**MINIMUM SCORE: 0 points**
+**MAXIMUM SCORE: 100 | MINIMUM SCORE: 0**
 
 **Score Calculation Example:**
 ```
 Starting Score: 100
-- Negative equity present (disclosed): -5
-- APR at 12%: 0 (Blue flag advisory only)
-+ Transparent itemization: +3
-+ VSC fairly priced: +3
-= Final Score: 101 → capped at 100
+  Negative equity >$10,000 (disclosed): -10
+  Missing GAP with $0 down + negative equity: -10
+  Transparent itemization: +3
+  Competitive APR: +5
+= Final Score: 88
 ```
 
-**You MUST include score breakdown in the narrative under a new field:**
-- **score_breakdown**: Detailed list of deductions and bonuses applied with reasoning (Blue flags excluded from score calculation)
+**MUST include detailed score_breakdown in narrative showing ALL deductions/bonuses with reasoning (exclude Blue flags - 0 point impact)**
 
-### GAP COVERAGE — AUTHORITATIVE LOGIC
+---
 
-**1) GAP Pricing Caps:**
-GAP price must be ≤ the lowest of:
+## GAP COVERAGE — AUTHORITATIVE LOGIC
+
+### 1) GAP Pricing Caps
+GAP price must be ≤ lowest of:
 - $1,200 (standard cap)
 - 3% of MSRP
-- $1,500 ONLY if MSRP ≥ $60,000
+- $1,500 ONLY if MSRP ≥$60,000
 
-**2) GAP Flags & Scoring:**
+### 2) Effective Down Payment Definition
+`Effective_Down = Cash_Down + max(Trade_Equity, 0)`
+*(Negative trade equity does NOT count toward down payment)*
 
-🟢 **GREEN FLAG (Fair GAP)**
-- Triggered when: GAP is present AND GAP price ≤ cap
-- Score impact: 0 points (neutral positive)
-- Language: Positive/neutral only
-- Example: "GAP coverage included at $895 - within pricing guidelines"
+### 3) GAP Flags & Scoring
 
-🔴 **RED FLAG (Overpriced GAP)**
-- Triggered when: GAP price > cap
-- Score impact: -10 points
-- Language: Overpricing / reduce or remove allowed
-- Example: "GAP insurance overpriced at $1,450 - exceeds fair market cap"
+**🟢 GREEN FLAG (Fair GAP)**
+- **Trigger**: GAP present AND GAP price ≤ cap
+- **Score**: +5 points
+- **Language**: Positive/neutral only
+- **Example**: "GAP coverage included at $895 - within pricing guidelines"
 
-🟡 **BLUE FLAG (Missing GAP — Protection Needed)**
-- Triggered when ALL of the following are true:
-  * $0 down payment
-  * Negative equity present
-  * (Loan term is NOT considered)
-- Score impact: -10 points
-- Language: Protection advisory only (NOT pricing criticism)
-- Example: "GAP coverage recommended - $0 down and negative equity present increase risk"
+**🔴 RED FLAG (Overpriced GAP)**
+- **Trigger**: GAP price > cap
+- **Score**: -10 points
+- **Language**: Overpricing/reduce or remove allowed
+- **Example**: "GAP insurance overpriced at $1,450 - exceeds fair market cap"
 
-**3) What GAP Logic Must NEVER Do:**
+**🔴 RED FLAG (High-Risk Financing Without GAP)**
+- **Trigger**: ALL must be true:
+  * GAP NOT present
+  * Effective_Down = $0
+  * Trade_Equity ≤ -$1,000
+- **Score**: -10 points
+- **Language**: Protection advisory focused on risk (NOT dealer fault)
+- **Example**: "High-Risk Financing Without GAP: No GAP coverage included with zero effective down payment and more than $1,000 in negative equity, creating elevated total-loss risk."
+
+### 4) GAP Logic Rules — NEVER DO THESE:
 ❌ Use loan term to trigger GAP flags
-❌ Penalize fairly priced GAP
-❌ Flag missing GAP without BOTH $0 down AND negative equity
+❌ Apply multiple penalties to GAP (only ONE outcome per deal)
+❌ Flag missing GAP without BOTH $0 effective down AND ≥$1,000 negative equity
 ❌ Use "average cost" language
-❌ Convert a GREEN flag into BLUE or RED flag
-❌ Apply multiple penalties to GAP (pricing OR disclosure - never both)
+❌ Convert GREEN flag into BLUE or RED flag
 
-**4) GAP Scenario Summary:**
-
+### 5) GAP Scenario Summary
 | Scenario | Flag | Score |
 |----------|------|-------|
-| GAP ≤ cap | 🟢 GREEN | 0 |
+| GAP ≤ cap | 🟢 GREEN | +5 |
 | GAP > cap | 🔴 RED | -10 |
-| GAP missing + $0 down + negative equity | 🟡 BLUE | -10 |
+| GAP missing + $0 effective down + ≤-$1,000 trade equity | 🔴 RED | -10 |
 | GAP missing (otherwise) | — | 0 |
 
-# SELLING PRICE FIELD DEFINITION
+---
 
-**The "selling_price" field MUST contain the vehicle cash price ONLY.**
+## SELLING PRICE FIELD DEFINITION
 
-**Extraction Priority (in order):**
-1. Look for "Cash Price" or "Vehicle Price" in the itemization section (typically pre-tax, pre-fees)
-2. If not found, use "Selling Price" from vehicle description area
-3. NEVER use:
-   ❌ Total Sale Price from Truth-in-Lending box
-   ❌ Amount Financed from Truth-in-Lending box
-   ❌ Total of Payments
-   ❌ Any value that includes taxes, fees, or backend products
+**"selling_price" MUST contain vehicle cash price ONLY**
+
+### Extraction Priority (in order):
+1. "Cash Price" or "Vehicle Price" in itemization section (pre-tax, pre-fees)
+2. If not found, "Selling Price" from vehicle description area
+3. **NEVER use:**
+   - ❌ Total Sale Price from Truth-in-Lending
+   - ❌ Amount Financed from Truth-in-Lending
+   - ❌ Total of Payments
+   - ❌ Any value including taxes/fees/backend products
 
 **Example:**
-- selling_price = $52,068.78 (vehicle cash price before taxes/fees)
-- NOT $67,158.60 (that's Amount Financed including taxes/fees/products)
+- ✅ selling_price = $52,068.78 (vehicle cash price)
+- ❌ NOT $67,158.60 (Amount Financed with taxes/fees/products)
 
-### SERVICE CONTRACT (VSC) ANALYSIS RULES
+---
 
-**Pricing Assessment (ONE OUTCOME PER VSC):**
-- VSC price below market threshold: GREEN FLAG (+3 points)
-- VSC price above market threshold: RED FLAG (-10 points)
-- VSC mileage cap issue (minimal remaining coverage): RED FLAG (-6 points)
-- **Critical Rule:** Only ONE penalty or bonus applies per VSC. Never stack pricing + mileage penalties.
+## SERVICE CONTRACT (VSC) ANALYSIS RULES
 
-**Context-Based Analysis (Advisory Only - NO POINT DEDUCTIONS):**
-- Mileage restrictions noted as advisory only (e.g., "13,000 miles remaining coverage")
-- Term vs coverage mismatch noted as advisory only
-- New vs used vehicle context noted as advisory only
-- **All percentage-based logic REMOVED** (no evaluation of VSC as % of vehicle value)
+### Pricing Assessment (ONE OUTCOME PER VSC)
+- VSC price **below** market threshold: **GREEN FLAG (+3)**
+- VSC price **above** market threshold: **RED FLAG (-10)**
+- VSC mileage cap issue (minimal remaining coverage): **RED FLAG (-6)**
+- **Critical Rule**: Only ONE penalty or bonus per VSC. Never stack pricing + mileage penalties.
 
-**Flag Logic (Enforced One-Outcome Rule):**
-- Price below threshold + adequate coverage = GREEN FLAG (+3 points)
-- Price below threshold BUT mileage cap issues = RED FLAG (-6 points) [mileage takes precedence as coverage defect]
-- Price above threshold = RED FLAG (-10 points) [pricing takes precedence]
-- VSC not itemized = GLOBAL -15 disclosure penalty (pricing evaluation suppressed)
+### Context-Based Analysis (Advisory Only - NO POINT DEDUCTIONS)
+- Mileage restrictions: advisory only
+- Term vs coverage mismatch: advisory only
+- New vs used vehicle context: advisory only
+- **All percentage-based logic REMOVED** (no VSC as % of vehicle value)
 
-🟢 GREEN FLAGS
+### Flag Logic (One-Outcome Rule)
+- Price below threshold + adequate coverage = **GREEN FLAG (+3)**
+- Price below threshold BUT mileage cap issues = **RED FLAG (-6)** [mileage takes precedence]
+- Price above threshold = **RED FLAG (-10)** [pricing takes precedence]
+- VSC not itemized = **GLOBAL -15 disclosure penalty** (pricing evaluation suppressed)
 
-✅ Fair, transparent, and consumer-friendly terms
-These indicate strong deal quality. No action needed—these elements support informed, confident decisions.
+---
 
-    VSC within fairness cap: Vehicle Service Contract price is at or below the SmartBuyer cap based on vehicle MSRP and condition. (+3 points)
-    GAP coverage fairly priced: GAP insurance present and within pricing cap (0 points - neutral positive)
-    Competitive APR (< 5%): Financing rate is well below market average for prime borrowers. (+5 points)
-    Transparent itemization: All fees and add-ons are clearly listed and explained. (+3 points)
-    Positive trade equity: Your trade-in value reduces the financed amount—no negative equity. (+4 points)
-    No unnecessary add-ons: Only relevant or requested products are included. (+3 points)
+## FLAG DEFINITIONS
 
-    💡 Green flags improve your deal score and reflect best practices.
+### 🟢 GREEN FLAGS
+✅ Fair, transparent, consumer-friendly terms
 
-🔵 BLUE FLAGS (ADVISORY ONLY - ZERO SCORE IMPACT)
+- **VSC within fairness cap**: Price ≤ SmartBuyer cap (+3)
+- **GAP coverage fairly priced**: GAP present and within cap (+5)
+- **Competitive APR (<5%)**: Well below market average (+5)
+- **Transparent itemization**: All fees/add-ons clearly listed (+3)
+- **Positive trade equity**: Trade value reduces financed amount (+5)
+- **No unnecessary add-ons**: Only relevant products included (+3)
 
-⚠️ Moderate risk or incomplete information
-These are informational only. They do NOT affect your score.
+### 🔵 BLUE FLAGS (ZERO SCORE IMPACT)
+⚠️ Informational only - does NOT affect score
 
-    APR between 10–15%: Higher-than-ideal financing cost—consider if better rates are available. (0 points)
-    Missing itemized fees: Total fees shown, but not broken down (e.g., "doc fee," "processing"). (0 points)
-    No breakdown of add-on coverage terms: Product listed but term/mileage/deductible details missing. (0 points)
-    Term longer than 72 months: Loan extends beyond 6 years, increasing total interest paid. (0 points)
-    Term vs coverage mismatch: Finance term exceeds coverage period. (0 points)
+- **APR 10–15%**: Higher cost—consider better rates (0)
+- **Missing itemized fees**: Total shown but not broken down (0)
+- **No add-on coverage breakdown**: Product listed but details missing (0)
+- **Term >72 months**: Loan >6 years increases interest (0)
+- **Term vs coverage mismatch**: Finance term exceeds coverage (0)
 
-    💡 Blue flags provide context but do not penalize your score.
-
-🔴 RED FLAGS
-
+### 🔴 RED FLAGS
 ❌ High-risk, overpriced, or non-compliant terms
-These signal potential harm, unfair pricing, or regulatory issues. Action strongly recommended.
 
-    Trade-in negative equity present (disclosed): You owe more on your trade than it's worth—this amount is being rolled into your new loan. (-5 points)
-    VSC exceeds fairness cap: Price is above the SmartBuyer threshold based on MSRP. (-10 points)
-    APR over 15%: High-cost financing that may indicate subprime risk or predatory terms. (-10 points)
-    APR over 20%: Extremely high-cost financing. (-15 points)
-    Document fees exceed state limits: Charges violate your state's maximum allowable doc fee. (-7 points)
-    GAP insurance overpriced: GAP price exceeds pricing cap - significantly inflated. (-10 points)
-    Maintenance plans overpriced (> $1,200): Well above market value for standard coverage. (-6 points)
-    Loan term over 84 months: Extremely long term (7+ years)—CFPB warns against such loans. (-8 points)
-    Global disclosure failure: Missing TILA disclosures OR backend products not itemized OR payment reconciliation failure. (-15 points - applied once per audit)
-    VSC mileage cap issue: Service contract has minimal remaining coverage due to mileage restrictions. (-6 points)
+- **Significant Negative Trade Equity**: >$10,000 rolled into loan (-10)
+- **Trade-in negative equity ≤$10,000 (disclosed)**: Amount rolled into new loan (-5)
+- **VSC exceeds fairness cap**: Above SmartBuyer threshold (-10)
+- **APR >15%**: High-cost financing/subprime risk (-10)
+- **APR >20%**: Extremely high-cost financing (-15)
+- **Document fees exceed state limits**: Violates max allowable fee (-7)
+- **GAP insurance overpriced**: Exceeds pricing cap (-10)
+- **Maintenance plans overpriced (>$1,200)**: Above market value (-6)
+- **Loan term >84 months**: 7+ years—CFPB warns against (-8)
+- **Global disclosure failure**: Missing TILA/itemization/payment reconciliation (-15, once per audit)
+- **VSC mileage cap issue**: Minimal remaining coverage (-6)
+- **High-Risk Financing Without GAP**: No GAP + $0 effective down + >$1,000 negative equity (-10)
 
-🟡 BLUE FLAGS (Advisory/Protective)
+### Flag Message Format Requirements
+- Negative equity >$10,000: Use "Significant Negative Trade Equity" with amount exceeds $10,000
+- Missing GAP risk: Use "High-Risk Financing Without GAP" with zero effective down + negative equity
+- Do NOT mention specific dollar thresholds beyond $10,000 distinction
+- Do NOT imply dealer misconduct/fault
+- Each distinct issue = separate flag (never combine)
 
-⚠️ Protection needed based on deal structure (Score impact: -10 points ONLY for missing GAP with $0 down + negative equity)
+---
 
-    Missing GAP coverage: GAP recommended - $0 down payment and negative equity present increase protection risk. (-10 points)
-    
-    💡 Blue flags indicate protective products should be considered for buyer safety.
+## NARRATIVE ANALYSIS STRUCTURE (REQUIRED)
 
-**Flag Message Format:**
-- Do NOT mention specific dollar thresholds in flag messages
-- Instead of: "Service contract price of $2,000 is under $5,000 threshold"
-- Use: "Service contract price of $2,000 is under threshold" OR "Service contract fairly priced at $2,000"
+The "narrative" object MUST be analytical, descriptive and contain these specific fields:
 
-### NARRATIVE ANALYSIS STRUCTURE (REQUIRED)
-The "narrative" object MUST contain specific detailed analysis fields. Do not use generic text.
-- **vehicle_overview**: Specifics of the car (Year, Make, Model, VIN, Mileage, New/Used).
-- **smartbuyer_score_summary**: Explanation of why the score was given based on price, rate, and add-ons.
-- **score_breakdown**: Itemized list of point deductions and bonuses ONLY (exclude Blue flag advisories which have 0 point impact)
-- **market_comparison**: How this deal compares to current market rates and Fair Market Value.
-- **gap_logic**: Analysis of GAP insurance using the authoritative logic above (present/absent, pricing vs cap, $0 down + negative equity check)
-- **vsc_logic**: Analysis of Vehicle Service Contract (price vs threshold OR mileage cap issue - one outcome only).
-- **apr_bonus_rule**: Analysis of the APR (is it marked up? is it subvented?).
-- **lease_audit**: Specific notes if this is a lease (or "Not a lease" if finance).
-- **negotiation_insight**: Specific talking points for the buyer to negotiate better terms.
-- **final_recommendation**: A clear "Buy", "Walk Away", or "Negotiate" verdict with reasons.
-- **trade**: Analysis of the trade-in (equity amount, allowance vs payoff, positive/negative equity status).
+- **vehicle_overview**: A analytic overview of Year, Make, Model, VIN, Mileage, New/Used atleast 100 words
+- **smartbuyer_score_summary**: A analytic overview of why score was given (price, rate, add-ons). Also include Score breakdown. Should have atleast 100 words
+- **score_breakdown**: Itemized deductions/bonuses ONLY (exclude Blue flags)
+- **market_comparison**: Deal vs current market rates and Fair Market Value. Should have atleast 100 words
+- **gap_logic**: GAP analysis using authoritative logic (present/absent, pricing vs cap, $0 down + negative equity check). Should have atleast 100 words
+- **vsc_logic**: VSC analysis (price vs threshold OR mileage cap - one outcome only). Should have atleast 100 words
+- **apr_bonus_rule**: Detailed APR analysis (marked up? subvented?). Should have atleast 100 words
+- **lease_audit**: Lease notes or "Not a lease"
+- **negotiation_insight**: Specific buyer talking points. Make it analytical and detailed. Should have atleast 100 words
+- **final_recommendation**: Do not be direct, recommend what steps should take in suggestive way. Should have atleast 100 words
+- **trade**: Trade-in detailed analysis (equity amount, allowance vs payoff, status) in details. Should have atleast 100 words
 
-### TOTAL SALE PRICE & AMOUNT FINANCED RESOLUTION (INTERNAL USE ONLY)
+---
 
-**For internal validation and calculations:**
+## TOTAL SALE PRICE & AMOUNT FINANCED (INTERNAL USE)
+
+### For internal validation/calculations:
 - When APR = 0.00% AND Finance Charge = $0.00:
-  - Amount Financed = Total of Payments
-  - Use Amount Financed for backend % calculations
+  * Amount Financed = Total of Payments
+  * Use Amount Financed for backend % calculations
 - If Finance Charge > $0.00:
-  - Amount Financed = Total of Payments - Finance Charge
-- Truth-in-Lending "Amount Financed" value is authoritative
+  * Amount Financed = Total of Payments - Finance Charge
+- Truth-in-Lending "Amount Financed" is authoritative
 
-**Backend Product Detection Rule (Single Penalty):**
-- If Amount Financed > Sum of Itemized Totals (vehicle + taxes + government fees + disclosed add-ons):
-  - Apply ONE -15 global disclosure penalty
-  - Do NOT attempt to identify specific product types (GAP/VSC/Maintenance)
-  - Do NOT apply multiple penalties for multiple undisclosed items
-  - Suppress all pricing evaluation for undisclosed products
+### Backend Product Detection (Single Penalty):
+- If Amount Financed > Sum of Itemized Totals:
+  * Apply ONE -15 global disclosure penalty
+  * Do NOT identify specific product types
+  * Do NOT apply multiple penalties
+  * Suppress pricing evaluation for undisclosed products
 
-**You MUST:**
+### YOU MUST:
 1. Extract vehicle cash price → output as "selling_price"
-2. Extract Amount Financed from Truth-in-Lending → use internally for calculations
+2. Extract Amount Financed from Truth-in-Lending → use internally
 3. NEVER overwrite selling_price with Amount Financed
 
-### CORE EXTRACTION REQUIREMENTS
+---
+
+## CORE EXTRACTION REQUIREMENTS
+
 Extract and analyze:
-1. Vehicle details (VIN, year, make, model, mileage, used/new status, MSRP)
+1. Vehicle details (VIN, year, make, model, mileage, used/new, MSRP)
 2. Financial terms (selling price, APR, term, monthly payment, down payment)
-3. ALL line items with EXACT text and amounts (extract as array)
-4. GAP coverage with pricing cap validation ($1,200 OR 3% MSRP OR $1,500 if MSRP ≥ $60k)
-5. VSC coverage with mileage-based cap calculation (one outcome per VSC)
+3. ALL line items with EXACT text and amounts (array)
+4. GAP coverage with pricing cap validation
+5. VSC coverage with mileage-based cap (one outcome)
 6. Maintenance plan pricing
 7. Doc fees and government fees
 8. Buyer/dealer information and contact details
 9. Trade information (allowance, payoff, equity)
-10. Down payment amount (critical for GAP Blue flag logic)
+10. Down payment (critical for GAP logic)
 
-### TRADE SECTION (REQUIRED - ALWAYS INCLUDE)
-If trade information is present:
+---
+
+## TRADE SECTION (REQUIRED - ALWAYS INCLUDE)
+
+### If trade present:
 - State: "Trade identified: $[allowance] allowance, $[payoff] payoff"
-- If payoff > allowance: "Negative equity of $[amount] rolled into new loan" (-5 points if disclosed)
-- If allowance > payoff: "Positive equity of $[amount] applied to purchase" (+4 points)
+- If payoff > allowance: "Negative equity of $[amount] rolled into new loan" (-5 if disclosed)
+- If allowance > payoff: "Positive equity of $[amount] applied to purchase" (+5)
 - If allowance = payoff: "Trade equity neutral"
-- If negative equity NOT disclosed in itemization: Triggers global -15 disclosure penalty (not separate penalty)
+- If negative equity NOT disclosed: Global -15 disclosure penalty (not separate)
 
-If no trade information is found in the document:
+### If no trade:
 - State: "No trade identified."
 
-This section CANNOT be omitted. It must always be present in the narrative.
+**This section CANNOT be omitted.**
 
-### APR ANALYSIS
-A. APR Disclosure:
-- APR not shown: Triggers global -15 disclosure penalty
+---
+
+## APR ANALYSIS
+
+### A. APR Disclosure
+- APR not shown: Global -15 disclosure penalty
 - APR shown: Extract and validate
 
-B. APR Risk Assessment:
-- APR > 10% AND ≤ 15%: Blue flag advisory only (0 points)
-- APR > 15% AND ≤ 20%: Red flag (-10 points)
-- APR > 20%: Red flag (-15 points)
+### B. APR Risk Assessment
+- APR >10% AND ≤15%: Blue flag (0 points)
+- APR >15% AND ≤20%: Red flag (-10)
+- APR >20%: Red flag (-15)
 
-C. APR Recognition:
-- APR < 10% AND APR > 0%: Favorable rate (note in analysis)
-- APR < 5% AND APR > 0%: Excellent rate (+5 points)
-- APR = 0.00%: Manufacturer-subvented rate (neutral observation, no deduction)
+### C. APR Recognition
+- APR <10% AND >0%: Favorable rate (note)
+- APR <5% AND >0%: Excellent rate (+5)
+- APR = 0.00%: Manufacturer-subvented (neutral, no deduction)
 
-### STRICT OUTPUT FORMAT REQUIREMENTS
-Output MUST be valid JSON with exactly these TOP-LEVEL FIELDS:
+---
+
+## STRICT OUTPUT FORMAT REQUIREMENTS
+
+**CRITICAL: Return ONLY valid, parseable JSON. No exceptions.**
+
+### JSON FORMATTING RULES (MANDATORY):
+1. Every property separated by comma (,)
+2. Every array element separated by comma (,)
+3. No trailing commas before } or ]
+4. String values use double quotes "
+5. Property names use double quotes "
+6. Use lowercase: true, false, null (not True, False, None)
+7. NO comments (// or /* */)
+8. NO markdown code blocks
+9. All braces/brackets properly matched
+10. Escape quotes in strings with \"
+
+### TOP-LEVEL FIELDS (REQUIRED):
 - score
 - buyer_name
 - dealer_name
@@ -342,51 +373,76 @@ Output MUST be valid JSON with exactly these TOP-LEVEL FIELDS:
 - state
 - region
 - badge
-- selling_price (VEHICLE CASH PRICE ONLY - see definition above)
+- selling_price (VEHICLE CASH PRICE ONLY)
 - vin_number
 - date
 - buyer_message
 - red_flags (array)
 - green_flags (array)
 - blue_flags (array)
-- yellow_flags (array - for GAP missing with $0 down + negative equity)
+- yellow_flags (array)
 - normalized_pricing (object)
 - apr (object)
 - term (object)
-- trade (object with fields: trade_allowance, trade_payoff, equity, negative_equity, status)
+- trade (object: trade_allowance, trade_payoff, equity, negative_equity, status)
 - bundle_abuse (object)
 - narrative (object)
 - line_items (array)
 
-The "narrative" object MUST have EXACTLY these fields:
-- vehicle_overview
-- smartbuyer_score_summary (MUST CONSIST ALL THE DEDUCTION AND ADDITION THAT HAPPENED IN THE CODE)
-- score_breakdown (required itemized breakdown of scored items only)
-- market_comparison
-- gap_logic (must follow authoritative GAP logic - check cap, $0 down, negative equity)
-- vsc_logic (must include ONE outcome: price analysis OR mileage cap analysis - never both)
-- apr_bonus_rule
-- lease_audit
-- negotiation_insight
-- final_recommendation
-- trade
+### Flag Object Structure (EXACT):
+```json
+{
+  "type": "Short title (≤10 words)",
+  "message": "Detailed explanation",
+  "item": "Item name (e.g., VSC, GAP, APR, Trade)",
+  "deduction": 10.0,  // ONLY red_flags
+  "bonus": 5.0       // ONLY green_flags
+}
+```
 
-### FINAL VALIDATION RULE
+**Field Requirements:**
+- "type" (REQUIRED): Brief description
+- "message" (REQUIRED): Detailed explanation but not long
+- "item" (REQUIRED): Item name
+- "deduction" (OPTIONAL): Only red_flags
+- "bonus" (OPTIONAL): Only green_flags
+
+**Example red flag:**
+```json
+{
+  "type": "VSC exceeds fair market value",
+  "message": "Extended warranty priced at $4,500 exceeds fair market threshold for this vehicle MSRP and condition.",
+  "item": "VSC",
+  "deduction": 10.0
+}
+```
+
+---
+
+## FINAL VALIDATION RULE
+
 Before returning JSON:
-- Verify selling_price represents vehicle cash price ONLY
-- Verify selling_price ≠ Amount Financed (unless deal has no taxes/fees)
-- For 0% APR deals: Amount Financed should be larger than selling_price
-- If selling_price seems too high (> $100k for normal vehicle), re-check extraction
-- Verify VSC analysis applies ONE outcome only (pricing OR mileage - never stacked)
-- Verify GAP logic follows authoritative rules (cap check, $0 down + negative equity for Blue flag)
-- Do NOT mention specific dollar thresholds in user-facing messages
-- Verify score_breakdown matches the final score calculation
-- Ensure all deductions have valid reasons
-- Do NOT use loan term to trigger GAP flags
-- Apply global -15 disclosure penalty ONLY ONCE per audit regardless of multiple disclosure failures
-- Blue flags must have 0 point impact in score calculation
+- ✅ selling_price = vehicle cash price ONLY
+- ✅ selling_price ≠ Amount Financed (unless no taxes/fees)
+- ✅ For 0% APR: Amount Financed > selling_price
+- ✅ If selling_price >$100k (normal vehicle), re-check
+- ✅ VSC = ONE outcome only (pricing OR mileage)
+- ✅ GAP logic follows authoritative rules
+- ✅ Do NOT mention dollar thresholds in messages
+- ✅ score_breakdown matches final score
+- ✅ All deductions have valid reasons
+- ✅ Do NOT use loan term for GAP flags
+- ✅ Global -15 penalty ONCE per audit only
+- ✅ Blue flags = 0 point impact
 
-Return ONLY valid JSON - no markdown, no explanation.
+### CRITICAL JSON CHECK:
+1. Arrays have commas: ["item1", "item2"]
+2. Objects have commas: {"key1": "val1", "key2": "val2"}
+3. No commas before } or ]
+4. All quotes closed
+5. Valid JSON (bracket/brace matching)
+
+**Return ONLY valid JSON - no markdown, no explanation, no extra text.**
 """
     
     async def _validate_files(self, files: List[UploadFile]) -> List[UploadFile]:
@@ -531,13 +587,51 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                 parsed = None
                 try:
                     parsed = json.loads(json_str)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as je:
                     # Try to fix common JSON issues
+                    print(f"[DEBUG] Initial JSON parse failed: {str(je)}")
+                    print(f"[DEBUG] Error at line {je.lineno}, column {je.colno}, position {je.pos}")
+                    print(f"[DEBUG] Malformed JSON (first 1000 chars): {json_str[:1000]}")
+                    
+                    # Show context around the error
+                    if je.pos and je.pos > 0:
+                        start = max(0, je.pos - 100)
+                        end = min(len(json_str), je.pos + 100)
+                        print(f"[DEBUG] Error context: ...{json_str[start:end]}...")
+                    
+                    # Attempt repair
                     json_str = self._attempt_json_repair(json_str)
                     try:
                         parsed = json.loads(json_str)
-                    except json.JSONDecodeError as je:
-                        raise RuntimeError(f"Failed to parse JSON even after repair: {str(je)}")
+                        print("[DEBUG] JSON successfully repaired")
+                    except json.JSONDecodeError as je2:
+                        print(f"[DEBUG] Repair failed: {str(je2)}")
+                        print(f"[DEBUG] Error at line {je2.lineno}, column {je2.colno}, position {je2.pos}")
+                        print(f"[DEBUG] Repaired JSON (first 1000 chars): {json_str[:1000]}")
+                        
+                        # Show context around the error after repair
+                        if je2.pos and je2.pos > 0:
+                            start = max(0, je2.pos - 100)
+                            end = min(len(json_str), je2.pos + 100)
+                            print(f"[DEBUG] Error context after repair: ...{json_str[start:end]}...")
+                        
+                        # Try advanced repair as last resort
+                        print("[DEBUG] Attempting advanced JSON repair...")
+                        json_str = self._advanced_json_repair(json_str)
+                        try:
+                            parsed = json.loads(json_str)
+                            print("[DEBUG] JSON successfully repaired with advanced method")
+                        except json.JSONDecodeError as je3:
+                            print(f"[DEBUG] Advanced repair also failed: {str(je3)}")
+                            # Save the problematic JSON to a file for debugging
+                            try:
+                                with open('/tmp/failed_json_response.txt', 'w') as f:
+                                    f.write(json_str)
+                                print("[DEBUG] Full JSON saved to /tmp/failed_json_response.txt")
+                            except:
+                                pass
+                            
+                            raise RuntimeError(f"Failed to parse JSON even after repair: {str(je3)}")
                 
                 # Ensure critical fields exist with defaults
                 defaults = {
@@ -578,6 +672,9 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                     if key not in parsed:
                         parsed[key] = value
                 
+                # Normalize flag field names
+                parsed = self._normalize_flag_fields(parsed)
+                
                 return parsed
             
             raise ValueError("No valid JSON found in response")
@@ -604,38 +701,256 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             # 2. Remove C-style comments (// ...)
             json_str = re.sub(r'//.*', '', json_str)
             
-            # 3. Fix trailing commas (common error: items = [a, b,])
+            # 3. Fix trailing commas BEFORE other fixes (common error: items = [a, b,])
             json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
             
-            # 4. Fix missing commas betweeen properties (MAJOR FIX)
-            # This looks for situations like: "key": "value" "nextKey": "val"
-            # It inserts a comma between valid value endings and the start of a new key
+            # 4. Fix missing commas between objects/arrays FIRST (most common in LLM output)
+            # { ... } { ... } -> { ... }, { ... }
+            json_str = re.sub(r'}\s+\{', '}, {', json_str)
+            # ] [ -> ], [
+            json_str = re.sub(r']\s+\[', '], [', json_str)
+            # ] { -> ], {
+            json_str = re.sub(r']\s+\{', '], {', json_str)
+            # } [ -> }, [
+            json_str = re.sub(r'}\s+\[', '}, [', json_str)
             
-            # Case A: String value followed by Next Key
-            # "value" "key": -> "value", "key":
-            # Uses positive lookahead (?=...) to find the next key structure
-            json_str = re.sub(r'"\s+(?="[\w-]+\s*":)', '", ', json_str)
+            # 5. Fix missing commas before keys (property separators)
+            # These patterns handle: value "key": -> value, "key":
             
-            # Case B: Number/Bool/Null followed by Next Key
-            # 123 "key": -> 123, "key":
-            json_str = re.sub(r'(?<=[0-9]|true|false|null)\s+(?="[\w-]+\s*":)', ', ', json_str)
+            # MULTI-PASS APPROACH: Apply multiple times to catch nested cases
+            for _ in range(5):  # Increased from 3 to 5 passes for better coverage
+                # String value followed by key (with or without quotes around key)
+                json_str = re.sub(r'"(\s+)("[\w\-_]+"\s*:)', r'",\1\2', json_str)
+                
+                # Number followed by key (including decimals and scientific notation)
+                json_str = re.sub(r'([0-9.eE+-]+)(\s+)("[\w\-_]+"\s*:)', r'\1,\2\3', json_str)
+                
+                # Boolean/null followed by key
+                json_str = re.sub(r'\b(true|false|null)(\s+)("[\w\-_]+"\s*:)', r'\1,\2\3', json_str)
+                
+                # Closing brace followed by key
+                json_str = re.sub(r'}(\s+)("[\w\-_]+"\s*:)', r'},\1\2', json_str)
+                
+                # Closing bracket followed by key
+                json_str = re.sub(r'](\s+)("[\w\-_]+"\s*:)', r'],\1\2', json_str)
+                
+                # Handle array elements without commas: "value1" "value2" -> "value1", "value2"
+                json_str = re.sub(r'"(\s+)"(?=[^:]*[,\]])', r'",\1"', json_str)
+                
+                # Handle object properties in arrays missing commas
+                # {...} {...} inside arrays
+                json_str = re.sub(r'(\{[^{}]*\})(\s+)(\{)', r'\1,\2\3', json_str)
             
-            # Case C: Closing Brace/Bracket followed by Next Key
-            # } "key": -> }, "key":
-            json_str = re.sub(r'(?<=[\]}])\s+(?="[\w-]+\s*":)', ', ', json_str)
+            # 6. Handle newline-separated properties (common in LLM output)
+            # Apply these after the space-based patterns
+            json_str = re.sub(r'"(\s*\n\s*)("[\w\-_]+"\s*:)', r'",\1\2', json_str)
+            json_str = re.sub(r'([0-9.eE+-]+)(\s*\n\s*)("[\w\-_]+"\s*:)', r'\1,\2\3', json_str)
+            json_str = re.sub(r'\b(true|false|null)(\s*\n\s*)("[\w\-_]+"\s*:)', r'\1,\2\3', json_str)
+            json_str = re.sub(r'}(\s*\n\s*)("[\w\-_]+"\s*:)', r'},\1\2', json_str)
+            json_str = re.sub(r'](\s*\n\s*)("[\w\-_]+"\s*:)', r'],\1\2', json_str)
             
-            # 5. Fix missing commas in string arrays (risky but necessary sometimes)
-            # "item1" "item2" -> "item1", "item2"
-            # Only applied if "item2" is NOT a key (no colon)
-            # We skip this for now to avoid breaking sentences in descriptions
+            # 7. Fix missing commas after array/object elements within arrays
+            # Pattern: ] "key" -> ], "key" (when inside array context)
+            json_str = re.sub(r'](\s+)"(?=[^:]*:)', r'],\1"', json_str)
+            json_str = re.sub(r'}(\s+)"(?=[^:]*:)', r'},\1"', json_str)
             
-            # 6. Handle specific Newline cases (fallback)
-            # "field": "val"\n"field2":
-            json_str = re.sub(r'"\s*\n\s*"', '",\n"', json_str)
+            # 8. Fix unclosed strings by ensuring even quotes (last resort)
+            # Count quotes - if odd, try to close the last one
+            quote_count = json_str.count('"')
+            if quote_count % 2 != 0:
+                # Find the last quote and check if it needs closing
+                last_quote_idx = json_str.rfind('"')
+                if last_quote_idx > 0 and last_quote_idx < len(json_str) - 1:
+                    # Check if there's a comma or bracket/brace after
+                    next_char = json_str[last_quote_idx + 1:].lstrip()
+                    if next_char and next_char[0] not in [',', '}', ']']:
+                        # Add closing quote before next structural element
+                        for i, char in enumerate(next_char):
+                            if char in [',', '}', ']', '\n']:
+                                insert_pos = last_quote_idx + 1 + len(json_str[last_quote_idx + 1:]) - len(next_char) + i
+                                json_str = json_str[:insert_pos] + '"' + json_str[insert_pos:]
+                                break
             
             return json_str
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] JSON repair exception: {str(e)}")
             # If regex fails, return original to let standard error handling propagate
+            return json_str
+    
+    def _normalize_flag_fields(self, parsed: dict) -> dict:
+        """
+        Normalize flag field names to match the expected schema.
+        Handles cases where AI returns 'title' instead of 'type', etc.
+        """
+        flag_arrays = ['red_flags', 'green_flags', 'blue_flags', 'yellow_flags']
+        
+        for flag_array_name in flag_arrays:
+            if flag_array_name in parsed and isinstance(parsed[flag_array_name], list):
+                normalized_flags = []
+                for flag in parsed[flag_array_name]:
+                    if isinstance(flag, dict):
+                        # Map alternative field names to expected ones
+                        normalized_flag = {}
+                        
+                        # Handle 'type' field (may come as 'title', 'name', 'type')
+                        normalized_flag['type'] = (
+                            flag.get('type') or 
+                            flag.get('title') or 
+                            flag.get('name') or 
+                            'Issue Identified'
+                        )
+                        
+                        # Handle 'message' field (may come as 'message', 'description', 'detail')
+                        normalized_flag['message'] = (
+                            flag.get('message') or 
+                            flag.get('description') or 
+                            flag.get('detail') or 
+                            flag.get('details') or 
+                            'No details provided'
+                        )
+                        
+                        # Handle 'item' field (may come as 'item', 'category', 'subject')
+                        normalized_flag['item'] = (
+                            flag.get('item') or 
+                            flag.get('category') or 
+                            flag.get('subject') or 
+                            'General'
+                        )
+                        
+                        # Handle optional fields
+                        if 'deduction' in flag:
+                            normalized_flag['deduction'] = flag['deduction']
+                        if 'bonus' in flag:
+                            normalized_flag['bonus'] = flag['bonus']
+                        
+                        normalized_flags.append(normalized_flag)
+                    else:
+                        # If it's not a dict, skip it
+                        continue
+                
+                parsed[flag_array_name] = normalized_flags
+        
+        return parsed
+    
+    def _advanced_json_repair(self, json_str: str) -> str:
+        """
+        Advanced JSON repair using character-by-character analysis.
+        This is a fallback when regex-based repair fails.
+        """
+        try:
+            result = []
+            in_string = False
+            escape_next = False
+            depth = 0
+            last_significant_char = None
+            i = 0
+            
+            while i < len(json_str):
+                char = json_str[i]
+                
+                # Handle escape sequences
+                if escape_next:
+                    result.append(char)
+                    escape_next = False
+                    i += 1
+                    continue
+                
+                if char == '\\' and in_string:
+                    escape_next = True
+                    result.append(char)
+                    i += 1
+                    continue
+                
+                # Track string state
+                if char == '"':
+                    in_string = not in_string
+                    result.append(char)
+                    if not in_string:
+                        last_significant_char = '"'
+                    i += 1
+                    continue
+                
+                # Skip whitespace tracking
+                if char in ' \t\n\r':
+                    result.append(char)
+                    i += 1
+                    continue
+                
+                # If we're in a string, just copy
+                if in_string:
+                    result.append(char)
+                    i += 1
+                    continue
+                
+                # Track structure depth
+                if char in '{[':
+                    depth += 1
+                    result.append(char)
+                    last_significant_char = char
+                    i += 1
+                    continue
+                
+                if char in '}]':
+                    depth -= 1
+                    # Check if we need a comma before this closing bracket
+                    # Look back for the last significant character
+                    if last_significant_char and last_significant_char not in [',', '{', '[', ':']:
+                        # We might be missing a comma, but closing brackets don't need one
+                        pass
+                    result.append(char)
+                    last_significant_char = char
+                    i += 1
+                    continue
+                
+                # Handle colons
+                if char == ':':
+                    result.append(char)
+                    last_significant_char = char
+                    i += 1
+                    continue
+                
+                # Handle commas
+                if char == ',':
+                    result.append(char)
+                    last_significant_char = char
+                    i += 1
+                    continue
+                
+                # We're about to process a value or key
+                # Check if we need a comma before it
+                if last_significant_char and last_significant_char not in [',', '{', '[', ':']:
+                    # Look ahead to see what we're processing
+                    # If it starts with ", it's likely a key or string value
+                    # If it's a number, boolean, null, it's a value
+                    # We need a comma if the last char was a closing quote, bracket, or value
+                    if last_significant_char in ['"', '}', ']'] or (isinstance(last_significant_char, str) and last_significant_char.isdigit()):
+                        # Look ahead to confirm this is a new property
+                        look_ahead = json_str[i:i+50].lstrip()
+                        if look_ahead.startswith('"'):
+                            # Check if there's a colon ahead (indicating a property)
+                            if ':' in look_ahead[:look_ahead.find('"', 1) + 10] if '"' in look_ahead[1:] else False:
+                                result.append(',')
+                
+                # Process the character
+                result.append(char)
+                
+                # Track what kind of character this was
+                if char.isdigit() or char in 'truefalsnl':  # part of true/false/null or number
+                    # Look ahead to get the full value
+                    value_start = i
+                    while i < len(json_str) and json_str[i] not in ' \t\n\r,}]':
+                        i += 1
+                    value = json_str[value_start:i]
+                    result.append(value[1:])  # We already added the first char
+                    last_significant_char = value[-1]
+                    continue
+                
+                last_significant_char = char
+                i += 1
+            
+            return ''.join(result)
+        except Exception as e:
+            print(f"[DEBUG] Advanced JSON repair failed: {str(e)}")
             return json_str
     
     def _assign_badge(self, score: float) -> str:
