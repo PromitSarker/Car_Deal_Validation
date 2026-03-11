@@ -26,7 +26,9 @@ def get_text_from_text_anchor(document_text, text_anchor):
     return document_text[start:end]
 
 @router.post("/upload", response_model=ExtractResponse)
-async def upload_and_extract(files: List[UploadFile] = File(...)):
+async def upload_and_extract(
+    files: List[UploadFile] = File(..., description="Upload document files (PDF, PNG, JPEG, TIFF)")
+):
     mime_map = {
         ".pdf": "application/pdf",
         ".png": "image/png",

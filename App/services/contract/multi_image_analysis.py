@@ -20,6 +20,7 @@ from App.services.rate_helper.audit_classifier import AuditClassifier, AuditClas
 from App.services.rate_helper.gap_logic import GAPLogic, GAPRecommendation
 from App.services.rate_helper.audit_flags import AuditFlagBuilder, AuditFlag
 from App.services.rate_helper.audit_summary import AuditSummary
+from App.services.rate_helper.json_to_parsed import convert_extracted_json_to_parsed
 
 load_dotenv()
 
@@ -41,6 +42,265 @@ class MultiImageAnalyzer:
         self.audit_classifier = AuditClassifier()
         self.gap_logic = GAPLogic()
         self.flag_builder = AuditFlagBuilder()
+
+    def _get_cache_dir(self) -> str:
+        """Return cache directory for deterministic extraction reuse."""
+        cache_dir = os.path.join(os.getcwd(), "App", "core", ".contract_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _make_cache_key(self, base64_images: List[str]) -> str:
+        """Create a stable cache key for the given image contents."""
+        import hashlib
+        hasher = hashlib.sha256()
+        for img in base64_images:
+            hasher.update(img.encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _load_cached_extraction(self, cache_key: str) -> Optional[dict]:
+        """Load cached extraction JSON if available."""
+        cache_path = os.path.join(self._get_cache_dir(), f"{cache_key}.json")
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_cached_extraction(self, cache_key: str, parsed: dict) -> None:
+        """Persist extraction JSON to cache for future reuse."""
+        cache_path = os.path.join(self._get_cache_dir(), f"{cache_key}.json")
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(parsed, f)
+        except Exception:
+            pass
+
+    def _make_flags_cache_key(self, language: str, flags_payload: list) -> str:
+        """Create a stable cache key for flag translation."""
+        import hashlib
+        hasher = hashlib.sha256()
+        hasher.update(language.lower().encode("utf-8"))
+        hasher.update(json.dumps(flags_payload, sort_keys=True).encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _load_cached_flag_translation(self, cache_key: str) -> Optional[dict]:
+        """Load cached flag translation JSON if available."""
+        cache_path = os.path.join(self._get_cache_dir(), f"flags_{cache_key}.json")
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_cached_flag_translation(self, cache_key: str, translated: dict) -> None:
+        """Persist flag translation JSON to cache for future reuse."""
+        cache_path = os.path.join(self._get_cache_dir(), f"flags_{cache_key}.json")
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(translated, f)
+        except Exception:
+            pass
+
+    def _translate_flags(self, flags: List[Flag], language: str) -> List[Flag]:
+        """Translate flag text fields to the requested language (no scoring changes)."""
+        language = self._normalize_language(language)
+        if language.lower() == "english":
+            return flags
+
+        flags_payload = [
+            {"type": f.type, "message": f.message, "item": f.item}
+            for f in flags
+        ]
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": "Translate the flag fields to the target language. Return JSON only with key 'flags'. Preserve structure and order."
+            },
+            {
+                "role": "user",
+                "content": f"Target language: {language}. Translate each object's 'type', 'message', and 'item'. Input JSON: {{\"flags\": {json.dumps(flags_payload)}}}"
+            }
+        ]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "seed": 42,
+            "max_tokens": 1000,
+            "response_format": {"type": "json_object"}
+        }
+        response = requests.post(self.api_url, headers=headers, json=payload, timeout=120)
+        response.raise_for_status()
+        parsed_translation = self._parse_api_response(response.json())
+        translated_list = parsed_translation.get("flags", []) if isinstance(parsed_translation, dict) else []
+
+        if not isinstance(translated_list, list) or len(translated_list) != len(flags):
+            return flags
+
+        translated_flags: List[Flag] = []
+        for original, translated in zip(flags, translated_list):
+            if not isinstance(translated, dict):
+                translated_flags.append(original)
+                continue
+            translated_flags.append(Flag(
+                type=translated.get("type", original.type),
+                message=translated.get("message", original.message),
+                item=translated.get("item", original.item),
+                deduction=original.deduction,
+                bonus=original.bonus
+            ))
+
+        return translated_flags
+
+    def _make_text_cache_key(self, language: str, payload: dict) -> str:
+        """Create a stable cache key for text translation payloads."""
+        import hashlib
+        hasher = hashlib.sha256()
+        hasher.update(language.lower().encode("utf-8"))
+        hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _normalize_language(self, language: Optional[str]) -> str:
+        """Normalize language input for consistent comparisons."""
+        if not language:
+            return "English"
+        return str(language).strip()
+
+    def _load_cached_text_translation(self, cache_key: str) -> Optional[dict]:
+        """Load cached text translation JSON if available."""
+        cache_path = os.path.join(self._get_cache_dir(), f"text_{cache_key}.json")
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_cached_text_translation(self, cache_key: str, translated: dict) -> None:
+        """Persist text translation JSON to cache for future reuse."""
+        cache_path = os.path.join(self._get_cache_dir(), f"text_{cache_key}.json")
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(translated, f)
+        except Exception:
+            pass
+
+    def _parse_json_object(self, response: dict) -> dict:
+        """Parse a JSON object from chat completion response without defaults."""
+        content = response["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            if all(isinstance(item, str) for item in content):
+                content = "".join(content)
+            else:
+                content = " ".join(str(item) for item in content)
+        elif content is None:
+            return {}
+        elif not isinstance(content, str):
+            content = str(content)
+
+        content = content.replace("```json", "").replace("```", "").strip()
+        json_start = content.find('{')
+        json_end = content.rfind('}') + 1
+        if json_start >= 0 and json_end > json_start:
+            json_str = content[json_start:json_end]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                json_str = self._attempt_json_repair(json_str)
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    return {}
+        return {}
+
+    def _translate_text_payload(self, payload: dict, language: str) -> dict:
+        """Translate a JSON payload's string values to the requested language."""
+        language = self._normalize_language(language)
+        if language.lower() == "english":
+            return payload
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": "Translate all string values in the provided JSON to the target language. Return JSON only with the same keys and structure. Do not translate numbers, dates, or JSON keys."
+            },
+            {
+                "role": "user",
+                "content": f"Target language: {language}. Input JSON: {json.dumps(payload)}"
+            }
+        ]
+        payload_request = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "seed": 42,
+            "max_tokens": 2000,
+            "response_format": {"type": "json_object"}
+        }
+        response = requests.post(self.api_url, headers=headers, json=payload_request, timeout=120)
+        response.raise_for_status()
+        translated = self._parse_json_object(response.json())
+        if isinstance(translated, dict) and translated:
+            return translated
+        return payload
+
+    def _translate_narrative_and_trade(self, narrative_data: dict, trade_status: Optional[str], buyer_message: Optional[str], language: str) -> tuple:
+        """Translate narrative fields, trade status, and buyer_message when defaults are used."""
+        language = self._normalize_language(language)
+        if language.lower() == "english":
+            return narrative_data, trade_status, buyer_message
+
+        fields = [
+            "vehicle_overview",
+            "smartbuyer_score_summary",
+            "score_breakdown",
+            "market_comparison",
+            "gap_logic",
+            "vsc_logic",
+            "apr_bonus_rule",
+            "lease_audit",
+            "negotiation_insight",
+            "final_recommendation",
+            "trade"
+        ]
+
+        narrative_payload = {field: str(narrative_data.get(field, "")) for field in fields}
+        payload = {
+            "narrative": narrative_payload,
+            "trade_status": str(trade_status) if trade_status else "",
+            "buyer_message": str(buyer_message) if buyer_message else ""
+        }
+
+        translated = self._translate_text_payload(payload, language)
+        if isinstance(translated, dict):
+            translated_narr = translated.get("narrative") if isinstance(translated.get("narrative"), dict) else {}
+            for field in fields:
+                translated_value = translated_narr.get(field)
+                if isinstance(translated_value, str) and translated_value.strip():
+                    narrative_data[field] = translated_value
+
+            translated_trade_status = translated.get("trade_status")
+            if isinstance(translated_trade_status, str) and translated_trade_status.strip():
+                trade_status = translated_trade_status
+
+            translated_buyer_message = translated.get("buyer_message")
+            if isinstance(translated_buyer_message, str) and translated_buyer_message.strip():
+                buyer_message = translated_buyer_message
+
+        return narrative_data, trade_status, buyer_message
     
 
     def _load_contract_system_prompt(self) -> str:
@@ -57,6 +317,7 @@ You are **SmartBuyer AI Contract Analysis Engine**. Analyze auto finance contrac
 - **green_flags**: MUST contain ≥1 positive element from actual contract analysis
 - **blue_flags**: MUST contain ≥1 advisory note OR explicitly state no advisories
 - **NEVER return empty arrays []** - causes validation failure
+- **CONSISTENCY REQUIREMENT**: Apply the same logic across all contracts - no per-deal variation
 
 ### 2. SCORING RULES
 - Do not reduce score without valid reason
@@ -72,7 +333,7 @@ You are **SmartBuyer AI Contract Analysis Engine**. Analyze auto finance contrac
 
 ### RED FLAG DEDUCTIONS (Major Issues)
 - Trade-in negative equity (disclosed) ≤$10,000: **-5**
-- Trade-in negative equity (disclosed) >$10,000: **-10**
+- **Trade-in negative equity (disclosed) >$10,000: -10**
 - VSC exceeds fairness threshold: **-10**
 - APR >15% and ≤20%: **-10**
 - APR >20%: **-15**
@@ -82,7 +343,7 @@ You are **SmartBuyer AI Contract Analysis Engine**. Analyze auto finance contrac
 - Loan term >84 months: **-8**
 - **Global disclosure failure** (missing TILA disclosures OR backend products not itemized OR payment reconciliation failure OR negative equity rolled in without disclosure): **-15 (applied ONCE per audit)**
 - VSC mileage cap issue (minimal remaining coverage): **-6**
-- Missing GAP with zero effective down payment AND negative equity ≤-$1,000: **-10**
+- **Missing GAP with zero effective down payment AND negative equity ≤-$1,000: -10**
 
 ### BLUE FLAGS (Advisory Only - ZERO POINT IMPACT)
 - APR between 10–15%: **0 points**
@@ -117,53 +378,228 @@ Starting Score: 100
 
 ## GAP COVERAGE — AUTHORITATIVE LOGIC
 
-### 1) GAP Pricing Caps
-GAP price must be ≤ lowest of:
-- $1,200 (standard cap)
-- 3% of MSRP
-- $1,500 ONLY if MSRP ≥$60,000
+### 1) GAP Recognition - CRITICAL OCR Dictionary
+**GAP coverage can appear under ANY of these names:**
+- "GAP"
+- "Debt Cancellation Agreement"
+- "DCA"
+- "Guaranteed Asset Protection"
+- "Loan/Lease Payoff Protection"
+- "Debt Protection"
 
-### 2) Effective Down Payment Definition
+**CRITICAL RULE**: If ANY of these terms appear with a dollar amount, classify as **GAP = PRESENT** and evaluate pricing.
+
+**PROCESSING LOGIC:**
+```
+# Step 1: Check for GAP presence
+if ANY_GAP_SYNONYM_found_in_contract:
+    gap_present = TRUE
+    gap_price = extract_dollar_amount_from_gap_line_item
+else:
+    gap_present = FALSE
+
+# Step 2: Calculate GAP cap
+gap_cap = min($1,200, 3% of MSRP, $1,500 if MSRP >= $60,000)
+
+# Step 3: Determine flag (ONLY ONE outcome)
+if gap_present == TRUE:
+    if gap_price <= gap_cap:
+        APPLY_GREEN_FLAG("+5 points", "GAP fairly priced")
+        DO_NOT_APPLY_RED_FLAG
+        DO_NOT_APPLY_BLUE_FLAG
+    else:
+        APPLY_RED_FLAG("-10 points", "GAP overpriced")
+        DO_NOT_APPLY_GREEN_FLAG
+        DO_NOT_APPLY_BLUE_FLAG
+else:
+    # GAP not present - check high-risk scenario
+    effective_down = cash_down + max(trade_equity, 0)
+    if effective_down == 0 AND trade_equity <= -$1,000:
+        APPLY_RED_FLAG("-10 points", "High-Risk Financing Without GAP")
+    else:
+        NO_FLAG_NEEDED
+```
+
+### 2) GAP Pricing Caps (Clarified Formula)
+GAP price must be ≤ LOWEST of:
+- **$1,200 (standard cap)**
+- **3% of MSRP**
+- **$1,500 ONLY if MSRP ≥$60,000**
+
+**Cap Calculation Examples:**
+- MSRP $40,000: 3% = $1,200 → Cap = min($1,200, $1,200) = **$1,200**
+- MSRP $69,625: 3% = $2,088.75 → Cap = min($1,200, $2,088.75, $1,500) = **$1,200**
+- MSRP $80,000: 3% = $2,400 → Cap = min($1,200, $2,400, $1,500) = **$1,200**
+
+### 3) Effective Down Payment Definition
 `Effective_Down = Cash_Down + max(Trade_Equity, 0)`
 *(Negative trade equity does NOT count toward down payment)*
 
-### 3) GAP Flags & Scoring
+### 4) GAP Flags & Scoring — ONE OUTCOME ONLY
 
-**🟢 GREEN FLAG (Fair GAP)**
-- **Trigger**: GAP present AND GAP price ≤ cap
+**🟢 GREEN FLAG (Fair GAP) — ONLY IF GAP PRESENT AND WITHIN CAP**
+- **Trigger**: GAP present **AND** GAP price ≤ cap
 - **Score**: +5 points
 - **Language**: Positive/neutral only
-- **Example**: "GAP coverage included at $895 - within pricing guidelines"
+- **Example**: "Debt Cancellation Agreement included at $1,032 - within $1,200 pricing cap for this vehicle (MSRP: $69,625)."
+- **CRITICAL**: If this flag applies, DO NOT apply ANY red flag or blue flag for GAP
 
-**🔴 RED FLAG (Overpriced GAP)**
-- **Trigger**: GAP price > cap
+**🔴 RED FLAG (Overpriced GAP) — ONLY IF GAP PRESENT AND EXCEEDS CAP**
+- **Trigger**: GAP present **AND** GAP price > cap
 - **Score**: -10 points
 - **Language**: Overpricing/reduce or remove allowed
-- **Example**: "GAP insurance overpriced at $1,450 - exceeds fair market cap"
+- **Example**: "GAP insurance overpriced at $1,450 - exceeds $1,200 fair market cap"
+- **CRITICAL**: Verify gap_price ACTUALLY exceeds cap before applying (e.g., $1,450 > $1,200 = TRUE)
+- **NEVER apply if**: gap_price <= cap (e.g., $1,032 <= $1,200 means NO red flag, GREEN flag instead)
 
-**🔴 RED FLAG (High-Risk Financing Without GAP)**
+**🔴 RED FLAG (High-Risk Financing Without GAP) — ONLY IF ALL CONDITIONS TRUE**
 - **Trigger**: ALL must be true:
-  * GAP NOT present
+  * GAP NOT present (no GAP synonyms found, including DCA)
   * Effective_Down = $0
   * Trade_Equity ≤ -$1,000
 - **Score**: -10 points
 - **Language**: Protection advisory focused on risk (NOT dealer fault)
-- **Example**: "High-Risk Financing Without GAP: No GAP coverage included with zero effective down payment and more than $1,000 in negative equity, creating elevated total-loss risk."
+- **Required Title**: "High-Risk Financing Without GAP"
+- **Required Message Format**: "No GAP coverage included with zero effective down payment and more than $1,000 in negative equity, creating elevated total-loss risk."
+- **CRITICAL**: DO NOT apply this flag if GAP is present (any synonym including DCA)
 
-### 4) GAP Logic Rules — NEVER DO THESE:
+### 5) GAP Logic Rules — NEVER DO THESE:
+
+❌ Apply BOTH green flag AND red flag for GAP (only ONE outcome)
+❌ Apply green flag AND blue flag for GAP (only ONE outcome)
+❌ State "GAP missing" when Debt Cancellation Agreement exists
+❌ Flag GAP as "overpriced" or "unusually high" when price ≤ cap (mathematical impossibility)
+❌ Use mathematical errors like "$1,032 exceeds $1,200"
+❌ Apply "High-Risk Without GAP" red flag when GAP/DCA is present
 ❌ Use loan term to trigger GAP flags
-❌ Apply multiple penalties to GAP (only ONE outcome per deal)
+❌ Apply multiple penalties to GAP
 ❌ Flag missing GAP without BOTH $0 effective down AND ≥$1,000 negative equity
 ❌ Use "average cost" language
 ❌ Convert GREEN flag into BLUE or RED flag
+❌ Use phrases like "GAP missing flag not triggered because..."
+❌ Use phrases like "Recommended but not mandatory" inside red flags
+❌ Use advisory language like "unusually high" for GAP within cap
 
-### 5) GAP Scenario Summary
-| Scenario | Flag | Score |
-|----------|------|-------|
-| GAP ≤ cap | 🟢 GREEN | +5 |
-| GAP > cap | 🔴 RED | -10 |
-| GAP missing + $0 effective down + ≤-$1,000 trade equity | 🔴 RED | -10 |
-| GAP missing (otherwise) | — | 0 |
+### 6) GAP Scenario Summary
+| Scenario | Flag | Score | Example |
+|----------|------|-------|---------|
+| GAP present, price ≤ cap | 🟢 GREEN ONLY | +5 | DCA at $1,032, cap $1,200 |
+| GAP present, price > cap | 🔴 RED ONLY | -10 | GAP at $1,450, cap $1,200 |
+| GAP missing + $0 effective down + ≤-$1,000 equity | 🔴 RED | -10 | No GAP/DCA found, meets risk criteria |
+| GAP missing (otherwise) | — | 0 | No flag needed |
+
+**VALIDATION CHECK BEFORE FINALIZING:**
+```
+# Pre-check: Scan contract for ALL GAP synonyms
+gap_synonyms = ["GAP", "Debt Cancellation Agreement", "DCA", 
+                "Guaranteed Asset Protection", "Loan/Lease Payoff Protection", 
+                "Debt Protection"]
+
+if any_synonym_found_with_price:
+    gap_present = TRUE
+    gap_price = extracted_amount
+    gap_cap = min($1,200, 3% of MSRP, $1,500 if MSRP >= $60,000)
+    
+    # Mathematical verification
+    if gap_price <= gap_cap:
+        MUST_HAVE: green_flag for GAP (+5)
+        MUST_NOT_HAVE: red_flag for GAP
+        MUST_NOT_HAVE: blue_flag for GAP
+        MUST_NOT_HAVE: "High-Risk Without GAP" red flag
+    else:  # gap_price > gap_cap
+        MUST_HAVE: red_flag "GAP overpriced" (-10)
+        MUST_NOT_HAVE: green_flag for GAP
+        MUST_NOT_HAVE: blue_flag for GAP
+        MUST_NOT_HAVE: "High-Risk Without GAP" red flag
+else:
+    gap_present = FALSE
+    # Check high-risk scenario
+    if effective_down == 0 AND trade_equity <= -$1,000:
+        MUST_HAVE: red_flag "High-Risk Financing Without GAP" (-10)
+    else:
+        NO_GAP_FLAG_NEEDED
+```
+
+---
+
+## DOCUMENT FEES - STATE-SPECIFIC RULES
+
+### State-by-State Documentation Fee Limits
+
+**States WITH Hard Caps (Flag if exceeded):**
+- California: $85
+- Florida: $995
+- Illinois: $300 (some exceptions)
+- New York: $175
+- Oregon: $150
+- Washington: $150
+
+**States WITHOUT Hard Caps (Flag only if clearly abusive):**
+- **Texas**: NO STATUTORY LIMIT
+  - Acceptable range: **$150-$250**
+  - Common range: **$175-$225**
+  - Flag only if: **>$300** (clearly excessive)
+- Georgia: No cap (flag if >$500)
+- Arizona: No cap (flag if >$500)
+- Nevada: No cap (flag if >$500)
+- Colorado: No cap (flag if >$500)
+
+### Documentation Fee Evaluation Logic
+
+**FOR TEXAS CONTRACTS:**
+```
+if state == "TX":
+    if doc_fee <= 150:
+        APPLY_GREEN_FLAG("+3 points", "below market")
+    elif doc_fee > 150 AND doc_fee <= 250:
+        NO_FLAG_NEEDED (neutral, 0 points)
+        OPTIONALLY: APPLY_GREEN_FLAG("+3 points", "within typical range")
+        NEVER: APPLY_RED_FLAG
+        NEVER: APPLY_BLUE_FLAG
+    elif doc_fee > 250 AND doc_fee <= 300:
+        APPLY_BLUE_FLAG("0 points", "advisory only")
+    else:  # doc_fee > 300
+        APPLY_RED_FLAG("-7 points", "exceeds reasonable range")
+```
+
+**FOR OTHER NO-CAP STATES:**
+- ≤$200: **GREEN FLAG** (+3)
+- $200-$300: **NEUTRAL** (0 points)
+- $300-$500: **BLUE FLAG** (0 points)
+- >$500: **RED FLAG** (-7)
+
+**FOR CAPPED STATES:**
+- Below cap: **GREEN FLAG** (+3) or neutral
+- At/near cap: **NEUTRAL** (0 points)
+- Above cap: **RED FLAG** (-7)
+
+### Documentation Fee Flag Examples
+
+**CORRECT Texas Example (No Red Flag):**
+```json
+// Doc fee = $225 in Texas
+// NO red flag, NO blue flag
+// Optionally include in green_flags:
+{
+  "type": "Reasonable Documentation Fee",
+  "message": "Documentation fee of $225 falls within typical market range for Texas dealerships ($150-$250).",
+  "item": "Documentation Fee",
+  "bonus": 3.0
+}
+```
+
+**INCORRECT Texas Example (DO NOT DO THIS):**
+```json
+// ❌ WRONG - Do not flag $225 in Texas as excessive
+{
+  "type": "Documentation fees exceed limits",
+  "message": "Documentation fee likely above Texas limits",
+  "item": "Documentation Fee",
+  "deduction": 7.0
+}
+```
+
+**CRITICAL RULE**: For Texas, doc fees $150-$250 are NEVER red flags and NEVER blue flags. Do not apply contradictory flags (both red and green). Do not use language like "likely above Texas limits" (Texas has no limit).
 
 ---
 
@@ -188,11 +624,63 @@ GAP price must be ≤ lowest of:
 
 ## SERVICE CONTRACT (VSC) ANALYSIS RULES
 
+### VSC Pricing Threshold Calculation (CRITICAL FORMULA)
+**SmartBuyer VSC Cap = min(15% of MSRP, $6,000)**
+
+**Step-by-Step Calculation:**
+1. Calculate 15% of MSRP
+2. Compare to hard cap of $6,000
+3. Use the LOWER value as the threshold
+
+**Examples:**
+- MSRP $30,000: 15% = $4,500 → Cap = min($4,500, $6,000) = **$4,500**
+- MSRP $40,000: 15% = $6,000 → Cap = min($6,000, $6,000) = **$6,000**
+- MSRP $69,625: 15% = $10,443.75 → Cap = min($10,443.75, $6,000) = **$6,000**
+- MSRP $80,000: 15% = $12,000 → Cap = min($12,000, $6,000) = **$6,000**
+
+**For vehicles with MSRP ≥$40,000, the cap is effectively $6,000**
+
 ### Pricing Assessment (ONE OUTCOME PER VSC)
-- VSC price **below** market threshold: **GREEN FLAG (+3)**
-- VSC price **above** market threshold: **RED FLAG (-10)**
+- VSC price **≤** SmartBuyer cap: **GREEN FLAG (+3)**
+- VSC price **>** SmartBuyer cap: **RED FLAG (-10)**
 - VSC mileage cap issue (minimal remaining coverage): **RED FLAG (-6)**
 - **Critical Rule**: Only ONE penalty or bonus per VSC. Never stack pricing + mileage penalties.
+
+### VSC Flag Logic - CRITICAL VALIDATION
+
+**BEFORE APPLYING ANY VSC FLAG:**
+```
+# Step 1: Extract MSRP
+msrp = extract_msrp_from_contract
+
+# Step 2: Calculate VSC cap
+vsc_15_percent = msrp * 0.15
+vsc_cap = min(vsc_15_percent, $6,000)
+
+# Step 3: Mathematical verification
+if vsc_price <= vsc_cap:
+    APPLY_GREEN_FLAG("+3 points", "VSC within fair market value")
+    DO_NOT_APPLY_RED_FLAG
+else:  # vsc_price > vsc_cap
+    APPLY_RED_FLAG("-10 points", "VSC exceeds fair market value")
+    DO_NOT_APPLY_GREEN_FLAG
+
+# Example verification:
+# MSRP = $69,625
+# 15% = $10,443.75
+# Cap = min($10,443.75, $6,000) = $6,000
+# VSC price = $3,500
+# Is $3,500 <= $6,000? YES → GREEN FLAG
+```
+
+**VSC Logic Rules — NEVER DO THESE:**
+
+❌ Flag VSC as "exceeds threshold" when price ≤ cap
+❌ Use incorrect cap calculation (forgetting min($6,000) constraint)
+❌ Apply red flag for VSC price under $6,000 when MSRP ≥$40,000
+❌ Apply both green and red flags for same VSC
+❌ Use percentage-based language ("X% of vehicle value")
+❌ Stack pricing + mileage penalties
 
 ### Context-Based Analysis (Advisory Only - NO POINT DEDUCTIONS)
 - Mileage restrictions: advisory only
@@ -201,9 +689,9 @@ GAP price must be ≤ lowest of:
 - **All percentage-based logic REMOVED** (no VSC as % of vehicle value)
 
 ### Flag Logic (One-Outcome Rule)
-- Price below threshold + adequate coverage = **GREEN FLAG (+3)**
-- Price below threshold BUT mileage cap issues = **RED FLAG (-6)** [mileage takes precedence]
-- Price above threshold = **RED FLAG (-10)** [pricing takes precedence]
+- Price ≤ threshold + adequate coverage = **GREEN FLAG (+3)**
+- Price ≤ threshold BUT mileage cap issues = **RED FLAG (-6)** [mileage takes precedence]
+- Price > threshold = **RED FLAG (-10)** [pricing takes precedence]
 - VSC not itemized = **GLOBAL -15 disclosure penalty** (pricing evaluation suppressed)
 
 ---
@@ -213,12 +701,34 @@ GAP price must be ≤ lowest of:
 ### 🟢 GREEN FLAGS
 ✅ Fair, transparent, consumer-friendly terms
 
+- **Reasonable documentation fee**: Within acceptable range for state (+3)
 - **VSC within fairness cap**: Price ≤ SmartBuyer cap (+3)
 - **GAP coverage fairly priced**: GAP present and within cap (+5)
 - **Competitive APR (<5%)**: Well below market average (+5)
 - **Transparent itemization**: All fees/add-ons clearly listed (+3)
 - **Positive trade equity**: Trade value reduces financed amount (+5)
 - **No unnecessary add-ons**: Only relevant products included (+3)
+
+#### For VSC Within Cap:
+- **REQUIRED Title**: "VSC within fair market value" or "Extended Warranty Fairly Priced"
+- **REQUIRED Message Format**: "Extended warranty priced at $[amount] is within the $[cap] fair market threshold for this vehicle (MSRP: $[msrp])."
+- **Score Impact**: +3 points
+- **Example**: "Extended warranty priced at $3,500 is within the $6,000 fair market threshold for this vehicle (MSRP: $69,625)."
+- **CRITICAL**: Only apply when vsc_price <= vsc_cap (verify math first)
+
+#### For GAP/DCA Present and Fair:
+- **REQUIRED Title**: "GAP Coverage Fairly Priced" or "Debt Cancellation Agreement Within Cap"
+- **REQUIRED Message Format**: "[GAP/Debt Cancellation Agreement] included at $[amount] - within $[cap] pricing cap for this vehicle (MSRP: $[msrp])."
+- **Score Impact**: +5 points
+- **Example**: "Debt Cancellation Agreement included at $1,032 - within $1,200 pricing cap for this vehicle (MSRP: $69,625)."
+- **CRITICAL**: Only apply if gap_price <= gap_cap (verify math: $1,032 <= $1,200 = TRUE)
+
+#### For Texas Documentation Fees $150-$250:
+- **REQUIRED**: NO red flag, NO blue flag, optionally green flag or neutral
+- **If Green Flag Used**: "Reasonable Documentation Fee"
+- **Message Format**: "Documentation fee of $[amount] falls within typical market range for Texas dealerships ($150-$250)."
+- **Score Impact**: +3 points OR 0 points (neutral)
+- **NEVER flag as excessive in this range**
 
 ### 🔵 BLUE FLAGS (ZERO SCORE IMPACT)
 ⚠️ Informational only - does NOT affect score
@@ -229,6 +739,8 @@ GAP price must be ≤ lowest of:
 - **Term >72 months**: Loan >6 years increases interest (0)
 - **Term vs coverage mismatch**: Finance term exceeds coverage (0)
 
+**CRITICAL**: Blue flags have ZERO point impact. Do not use blue flags for items that should be green (e.g., GAP within cap, VSC within cap, doc fees in acceptable range).
+
 ### 🔴 RED FLAGS
 ❌ High-risk, overpriced, or non-compliant terms
 
@@ -238,19 +750,108 @@ GAP price must be ≤ lowest of:
 - **APR >15%**: High-cost financing/subprime risk (-10)
 - **APR >20%**: Extremely high-cost financing (-15)
 - **Document fees exceed state limits**: Violates max allowable fee (-7)
-- **GAP insurance overpriced**: Exceeds pricing cap (-10)
+- **GAP insurance overpriced**: Exceeds pricing cap (-10) - **ONLY if gap_price > gap_cap**
 - **Maintenance plans overpriced (>$1,200)**: Above market value (-6)
 - **Loan term >84 months**: 7+ years—CFPB warns against (-8)
 - **Global disclosure failure**: Missing TILA/itemization/payment reconciliation (-15, once per audit)
 - **VSC mileage cap issue**: Minimal remaining coverage (-6)
-- **High-Risk Financing Without GAP**: No GAP + $0 effective down + >$1,000 negative equity (-10)
+- **High-Risk Financing Without GAP**: No GAP + $0 effective down + >$1,000 negative equity (-10) - **ONLY if GAP not present**
 
-### Flag Message Format Requirements
-- Negative equity >$10,000: Use "Significant Negative Trade Equity" with amount exceeds $10,000
-- Missing GAP risk: Use "High-Risk Financing Without GAP" with zero effective down + negative equity
+### Flag Message Format Requirements - CRITICAL UPDATES
+
+#### For Negative Equity >$10,000:
+- **REQUIRED Title**: "Significant Negative Trade Equity"
+- **REQUIRED Message Format**: "Trade-in negative equity of $[exact_amount] exceeds $10,000 and was rolled into the new loan."
+- **Score Impact**: -10 (NOT -5)
+- **DO NOT use generic phrases** like "negative equity present (disclosed)"
+- **DO NOT combine** with GAP flag into one message
+
+#### For Missing GAP with High Risk:
+- **REQUIRED Title**: "High-Risk Financing Without GAP"
+- **REQUIRED Message Format**: "No GAP coverage included with zero effective down payment and more than $1,000 in negative equity, creating elevated total-loss risk."
+- **Score Impact**: -10
+- **This is a SEPARATE red flag** from negative equity
+- **DO NOT imply dealer misconduct**
+- **CRITICAL**: Only apply if GAP/DCA is NOT present in contract (verify all synonyms checked)
+
+#### For GAP Overpriced (RARE - verify math first):
+- **REQUIRED Title**: "GAP exceeds fair market value" or "GAP insurance overpriced"
+- **REQUIRED Message Format**: "GAP insurance priced at $[amount] exceeds fair market cap of $[cap] for this vehicle (MSRP: $[msrp])."
+- **Score Impact**: -10
+- **MATHEMATICAL VALIDATION REQUIRED**: Verify gap_price > gap_cap before applying
+- **Example of CORRECT red flag**: "$1,450 exceeds $1,200 cap" (1450 > 1200 = TRUE)
+- **Example of INCORRECT red flag**: "$1,032 exceeds $1,200 cap" (1032 > 1200 = FALSE) ❌
+
+#### For VSC Overpriced (verify cap calculation):
+- **REQUIRED Title**: "VSC exceeds fair market value"
+- **REQUIRED Message Format**: "Extended warranty priced at $[amount] exceeds the $[cap] fair market threshold for this vehicle (MSRP: $[msrp])."
+- **Score Impact**: -10
+- **MATHEMATICAL VALIDATION REQUIRED**: 
+  - Cap = min(15% × MSRP, $6,000)
+  - Verify vsc_price > cap before applying
+- **Example of CORRECT red flag**: "$7,200 exceeds $6,000 cap for MSRP $69,625" (7200 > 6000 = TRUE)
+- **Example of INCORRECT red flag**: "$3,500 exceeds $6,000 cap for MSRP $69,625" (3500 > 6000 = FALSE) ❌
+
+#### General Rules:
+- Each distinct issue = separate flag (never combine)
 - Do NOT mention specific dollar thresholds beyond $10,000 distinction
 - Do NOT imply dealer misconduct/fault
-- Each distinct issue = separate flag (never combine)
+- Do NOT use language like "recommended but not mandatory" in red flags
+- Do NOT include explanations like "flag not triggered because..."
+- **VERIFY MATH** before applying any "exceeds" flag
+- **VERIFY GAP PRESENCE** (check all synonyms) before applying "missing GAP" flag
+
+### NEVER SHOW IN OUTPUT:
+❌ "GAP missing flag not triggered because…"
+❌ Any -5 reference for negative equity >$10,000
+❌ Language suggesting disclosure = penalty
+❌ "Recommended but not mandatory" phrasing inside red flags
+❌ Combined negative equity + GAP messages
+❌ "Unusually high" for GAP within cap
+❌ Missing recognition of "Debt Cancellation Agreement" as GAP
+❌ Mathematical errors like "$1,032 exceeds $1,200"
+❌ Red flag stating "No GAP coverage" when DCA exists
+❌ Both red AND green flags for same item
+❌ "Likely above Texas limits" for doc fees (Texas has no limit)
+❌ Red or blue flags for Texas doc fees in $150-$250 range
+❌ Red flags for VSC under cap when MSRP ≥$40,000
+
+---
+
+## CONSISTENCY REQUIREMENTS
+
+### Contract Mode Unified Logic
+**The following rules MUST be applied identically across ALL contracts:**
+
+1. **VSC Cap Calculation**: Always use min(15% of MSRP, $6,000)
+2. **GAP Recognition**: Check ALL synonym terms (GAP, DCA, Debt Cancellation Agreement, Guaranteed Asset Protection, Loan/Lease Payoff Protection, Debt Protection)
+3. **GAP Cap Calculation**: Always use min($1,200, 3% MSRP, $1,500 if MSRP≥$60k)
+4. **Doc Fee Evaluation**: Apply state-specific rules consistently (Texas: $150-$250 = acceptable)
+5. **Scoring Logic**: Same deduction/bonus amounts for same scenarios
+6. **Mathematical Accuracy**: Verify all "exceeds" statements are mathematically true
+
+### Pre-Analysis Checklist
+Before scoring any contract, verify:
+- [ ] MSRP extracted correctly
+- [ ] VSC cap = min(15% × MSRP, $6,000) calculated
+- [ ] All GAP synonyms checked (especially "Debt Cancellation Agreement")
+- [ ] GAP cap = min($1,200, 3% × MSRP, $1,500 if MSRP≥$60k) calculated
+- [ ] State identified for doc fee rules
+- [ ] Same logic as prior successful audits
+- [ ] No contradictory flags (red + green for same item)
+- [ ] Mathematical statements verified (e.g., "$1,032 exceeds $1,200" = FALSE)
+- [ ] Texas doc fees in $150-$250 range flagged correctly (neutral or green, never red/blue)
+
+### Scoring Consistency Validation
+**Before finalizing score:**
+1. Verify VSC evaluation matches formula
+2. Verify GAP evaluation matches formula and recognizes DCA
+3. Verify doc fee follows state rules (especially Texas)
+4. Confirm no regression from prior correct audits
+5. Ensure score_breakdown matches narrative
+6. **Verify no mathematical impossibilities** (amount "exceeds" cap when it doesn't)
+7. **Verify GAP presence before applying "missing GAP" red flag**
+8. **Verify VSC cap calculation includes min($6,000) constraint**
 
 ---
 
@@ -259,11 +860,29 @@ GAP price must be ≤ lowest of:
 The "narrative" object MUST be analytical, descriptive and contain these specific fields:
 
 - **vehicle_overview**: A analytic overview of Year, Make, Model, VIN, Mileage, New/Used atleast 100 words
-- **smartbuyer_score_summary**: A analytic overview of why score was given (price, rate, add-ons). Also include Score breakdown. Should have atleast 100 words
+- **smartbuyer_score_summary**: A analytic overview of why score was given (price, rate, add-ons). Also include Score breakdown. Should have atleast 100 words. **MUST follow this EXACT format**:
+   ```
+   Starting score: 100.
+   Deducted [X] points for [specific reason].
+   Deducted [X] points for [specific reason].
+   Added [X] points for [specific reason].
+   Final score: [total].
+   ```
+   **CRITICAL RULES FOR SCORE SUMMARY**:
+   - Use -10 (NOT -5) for negative equity >$10,000
+   - State "significant negative trade-in equity exceeding $10,000" (NOT "disclosed negative trade-in equity")
+   - State "high-risk financing without GAP coverage" as separate deduction ONLY IF GAP/DCA not present
+   - Each deduction/bonus on separate line
+   - Text must auto-adjust based on which rules fire
+   - **If DCA present and within cap**: "Added 5 points for GAP coverage fairly priced at $[amount] within the $[cap] cap."
+   - **If DCA present but overpriced**: "Deducted 10 points for GAP insurance overpriced at $[amount] exceeding the $[cap] cap."
+   - **If VSC within cap**: "Added 3 points for extended warranty fairly priced at $[amount] within the $[cap] threshold."
+   - **If VSC exceeds cap**: "Deducted 10 points for extended warranty overpriced at $[amount] exceeding the $[cap] threshold."
+   
 - **score_breakdown**: Itemized deductions/bonuses ONLY (exclude Blue flags)
 - **market_comparison**: Deal vs current market rates and Fair Market Value. Should have atleast 100 words
-- **gap_logic**: GAP analysis using authoritative logic (present/absent, pricing vs cap, $0 down + negative equity check). Should have atleast 100 words
-- **vsc_logic**: VSC analysis (price vs threshold OR mileage cap - one outcome only). Should have atleast 100 words
+- **gap_logic**: GAP analysis using authoritative logic (present/absent, pricing vs cap, $0 down + negative equity check). Should have atleast 100 words. **MUST accurately state if DCA is present and correctly evaluate pricing.**
+- **vsc_logic**: VSC analysis (price vs threshold OR mileage cap - one outcome only). Should have atleast 100 words. **MUST use correct cap calculation.**
 - **apr_bonus_rule**: Detailed APR analysis (marked up? subvented?). Should have atleast 100 words
 - **lease_audit**: Lease notes or "Not a lease"
 - **negotiation_insight**: Specific buyer talking points. Make it analytical and detailed. Should have atleast 100 words
@@ -302,7 +921,7 @@ Extract and analyze:
 1. Vehicle details (VIN, year, make, model, mileage, used/new, MSRP)
 2. Financial terms (selling price, APR, term, monthly payment, down payment)
 3. ALL line items with EXACT text and amounts (array)
-4. GAP coverage with pricing cap validation
+4. GAP coverage with pricing cap validation (check ALL synonyms including DCA)
 5. VSC coverage with mileage-based cap (one outcome)
 6. Maintenance plan pricing
 7. Doc fees and government fees
@@ -316,10 +935,12 @@ Extract and analyze:
 
 ### If trade present:
 - State: "Trade identified: $[allowance] allowance, $[payoff] payoff"
-- If payoff > allowance: "Negative equity of $[amount] rolled into new loan" (-5 if disclosed)
+- If payoff > allowance AND (payoff - allowance) ≤ $10,000: "Negative equity of $[amount] rolled into new loan" (-5)
+- If payoff > allowance AND (payoff - allowance) > $10,000: "Significant negative equity of $[amount] exceeds $10,000 and was rolled into new loan" (-10)
 - If allowance > payoff: "Positive equity of $[amount] applied to purchase" (+5)
 - If allowance = payoff: "Trade equity neutral"
 - If negative equity NOT disclosed: Global -15 disclosure penalty (not separate)
+- Provide a analytical and descriptive trade analysis in narrative
 
 ### If no trade:
 - State: "No trade identified."
@@ -401,17 +1022,59 @@ Extract and analyze:
 ```
 
 **Field Requirements:**
-- "type" (REQUIRED): Brief description
-- "message" (REQUIRED): Detailed explanation but not long
+- "type" (REQUIRED): Brief description - MUST match required titles for negative equity >$10k and missing GAP. 
+- "message" (REQUIRED): Detailed explanation - MUST match required message formats
 - "item" (REQUIRED): Item name
 - "deduction" (OPTIONAL): Only red_flags
 - "bonus" (OPTIONAL): Only green_flags
 
-**Example red flag:**
+**Example red flags for the two critical scenarios:**
+
+**Negative Equity >$10,000:**
+```json
+{
+  "type": "Significant Negative Trade Equity",
+  "message": "Trade-in negative equity of $13,248.34 exceeds $10,000 and was rolled into the new loan.",
+  "item": "Trade",
+  "deduction": 10.0
+}
+```
+
+**Missing GAP with High Risk (ONLY if GAP/DCA not found):**
+```json
+{
+  "type": "High-Risk Financing Without GAP",
+  "message": "No GAP coverage included with zero effective down payment and more than $1,000 in negative equity, creating elevated total-loss risk.",
+  "item": "GAP",
+  "deduction": 10.0
+}
+```
+
+**GAP/DCA Present and Fair (ONLY if gap_price <= gap_cap):**
+```json
+{
+  "type": "GAP Coverage Fairly Priced",
+  "message": "Debt Cancellation Agreement included at $1,032 - within $1,200 pricing cap for this vehicle (MSRP: $69,625).",
+  "item": "GAP",
+  "bonus": 5.0
+}
+```
+
+**Example VSC green flag (when within cap):**
+```json
+{
+  "type": "VSC within fair market value",
+  "message": "Extended warranty priced at $3,500 is within the $6,000 fair market threshold for this vehicle (MSRP: $69,625).",
+  "item": "VSC",
+  "bonus": 3.0
+}
+```
+
+**Example VSC red flag (when exceeds cap - verify math):**
 ```json
 {
   "type": "VSC exceeds fair market value",
-  "message": "Extended warranty priced at $4,500 exceeds fair market threshold for this vehicle MSRP and condition.",
+  "message": "Extended warranty priced at $7,200 exceeds the $6,000 fair market threshold for this vehicle (MSRP: $69,625).",
   "item": "VSC",
   "deduction": 10.0
 }
@@ -422,18 +1085,37 @@ Extract and analyze:
 ## FINAL VALIDATION RULE
 
 Before returning JSON:
+- ✅ **VSC cap = min(15% × MSRP, $6,000) - ALWAYS**
+- ✅ **VSC = ONE outcome only using correct cap formula**
+- ✅ **If VSC ≤ cap → GREEN FLAG (+3), NO red flag**
+- ✅ **If VSC > cap → RED FLAG (-10), NO green flag**
+- ✅ **GAP recognized if DCA, Debt Cancellation Agreement, or any synonym present**
+- ✅ **If GAP/DCA found → gap_present = TRUE**
+- ✅ **GAP pricing uses min($1,200, 3% MSRP, $1,500 if MSRP≥$60k) formula**
+- ✅ **If gap_price <= gap_cap → GREEN FLAG ONLY (+5), NO red/blue flags**
+- ✅ **If gap_price > gap_cap → RED FLAG ONLY (-10), NO green/blue flags**
+- ✅ **If GAP not present + $0 down + ≤-$1,000 equity → RED FLAG "High-Risk Without GAP"**
+- ✅ **Texas doc fees $150-$250 → NO red flag, NO blue flag, optionally green or neutral**
+- ✅ **Logic matches prior successful audits**
 - ✅ selling_price = vehicle cash price ONLY
 - ✅ selling_price ≠ Amount Financed (unless no taxes/fees)
 - ✅ For 0% APR: Amount Financed > selling_price
 - ✅ If selling_price >$100k (normal vehicle), re-check
-- ✅ VSC = ONE outcome only (pricing OR mileage)
-- ✅ GAP logic follows authoritative rules
-- ✅ Do NOT mention dollar thresholds in messages
+- ✅ Negative equity >$10,000 uses "Significant Negative Trade Equity" title and -10 deduction
+- ✅ Missing GAP with risk uses "High-Risk Financing Without GAP" title and -10 deduction (ONLY IF GAP/DCA NOT FOUND)
+- ✅ These are TWO SEPARATE red flags (never combined)
+- ✅ **NO contradictory flags**: Cannot have both red and green for same item
+- ✅ **NO green + blue flags**: Cannot have both for same item
+- ✅ **Math verified**: All "exceeds" statements are mathematically true
+- ✅ **VSC $3,500 with MSRP $69,625**: Cap = $6,000, therefore GREEN FLAG (3500 < 6000)
+- ✅ **GAP/DCA $1,032 with MSRP $69,625**: Cap = $1,200, therefore GREEN FLAG (1032 < 1200)
 - ✅ score_breakdown matches final score
+- ✅ smartbuyer_score_summary uses correct deduction amounts (-10 not -5 for >$10k equity)
 - ✅ All deductions have valid reasons
 - ✅ Do NOT use loan term for GAP flags
 - ✅ Global -15 penalty ONCE per audit only
 - ✅ Blue flags = 0 point impact
+- ✅ NO forbidden phrases in output (see NEVER SHOW IN OUTPUT section)
 
 ### CRITICAL JSON CHECK:
 1. Arrays have commas: ["item1", "item2"]
@@ -469,7 +1151,7 @@ Before returning JSON:
             await file.seek(0)
         return base64_images
     
-    def _call_openai_api(self, base64_images: List[str]) -> dict:
+    def _call_openai_api(self, base64_images: List[str], language: str = "English") -> dict:
         """Call OpenAI API with contract documents"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -480,66 +1162,95 @@ Before returning JSON:
             {
                 "type": "text",
                 "text": f"""
-Analyze these contract documents comprehensively.
+{'=' * 80}
+LANGUAGE REQUIREMENT: ALL narrative text fields MUST be in {language}
+{'=' * 80}
 
-{self.system_prompt}
+Translate these specific fields to {language}:
+- narrative.vehicle_overview
+- narrative.smartbuyer_score_summary
+- narrative.score_breakdown
+- narrative.market_comparison
+- narrative.gap_logic
+- narrative.vsc_logic
+- narrative.apr_bonus_rule
+- narrative.trade
+- narrative.negotiation_insight
+- narrative.final_recommendation
+- All flag messages (red_flags, green_flags, blue_flags)
+- buyer_message
 
-### CRITICAL INSTRUCTION: SCORE CONSISTENCY
-**Temperature is set to 0 for deterministic output. Your score MUST be consistent across multiple runs of the same document.**
+KEEP in English: JSON keys, field names, badge values, numbers, dates
+{'=' * 80}
 
-**SCORING VALIDATION CHECKLIST:**
-1. Start at exactly 100 points
-2. Apply each penalty/bonus EXACTLY ONCE per issue
-3. Do NOT round intermediate calculations
-4. Cap final score at 100 (max) and 0 (min)
-5. Verify score_breakdown math matches final score
-
-**Example Verification:**
-```
-Base: 100.00
-- Negative equity (disclosed): -5.00
-- APR 18%: -10.00
-+ Transparent itemization: +3.00
-= Subtotal: 88.00
-Final Score: 88.00 (within 0-100 range)
-```
-
-### CRITICAL INSTRUCTION: DATA POPULATION
-**You must populate the specific JSON fields with the exact numbers you find.** 
-Do not leave fields null if the data is present in the document or your own narrative analysis.
-
-**CHECKLIST FOR JSON POPULATION:**
-1. **selling_price**: Must match the Cash Price/Vehicle Price found ($52,086.78 in example).
-2. **trade**: You MUST fill in `trade_allowance`, `trade_payoff`, and `negative_equity` if trade info exists.
-   - Example: If you write "Trade identified: $27,544.57 allowance", then `trade.trade_allowance` MUST be 27544.57.
-3. **apr**: You MUST fill in `apr.rate` (e.g., 0.00).
-4. **normalized_pricing**: You MUST fill in `amount_financed`, `total_taxes`, `total_fees`.
-
-**DOUBLE CHECK:** 
-If you mention a number in the "narrative" or "flags", verify it is ALSO in the top-level field.
-- If narrative says "APR is 0.00%", then `apr.rate` must be 0.00.
-- If narrative says "Cash price is $52,086.78", then `selling_price` must be 52086.78.
-
-Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
+Analyze these contract documents comprehensively and return ONLY valid JSON matching the exact schema. No markdown, no explanation.
 """
             }
         ]
 
-        for base64_image in base64_images:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}",
-                    "detail": "high"
-                }
-            })
+        if base64_images:
+            for base64_image in base64_images:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}",
+                        "detail": "high"
+                    }
+                })
 
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"""!!!ABSOLUTE PRIORITY - LANGUAGE OVERRIDE - THIS OVERRIDES EVERYTHING!!!
+
+OUTPUT LANGUAGE: {language}
+
+=== CRITICAL INSTRUCTION ===
+The system prompt contains English text like:
+- "REQUIRED Title: 'Significant Negative Trade Equity'"
+- "REQUIRED Title: 'High-Risk Financing Without GAP'"
+- "REQUIRED Message Format: 'Trade-in negative equity of...'"
+- "VSC within fair market value"
+- "Reasonable Documentation Fee"
+
+THESE ARE EXAMPLES ONLY - YOU MUST TRANSLATE THEM TO {language}!
+
+When you see "REQUIRED Title: 'X'" → translate 'X' to {language}
+When you see "REQUIRED Message Format: 'Y'" → translate 'Y' to {language}
+
+ABSOLUTELY MANDATORY TRANSLATIONS:
+• Every flag "type" field → MUST be in {language}
+• Every flag "message" field → MUST be in {language}
+• Every narrative field → MUST be in {language}
+• buyer_message → MUST be in {language}
+
+EXAMPLE for Bengali:
+- "Significant Negative Trade Equity" → "উল্লেখযোগ্য নেতিবাচক ট্রেড ইক্যুইটি"
+- "High-Risk Financing Without GAP" → "GAP ছাড়া উচ্চ ঝুঁকিপূর্ণ অর্থায়ন"
+- "VSC within fair market value" → "ন্যায্য বাজার মূল্যের মধ্যে VSC"
+
+ONLY KEEP IN ENGLISH:
+• JSON keys ("type", "message", "red_flags", etc.)
+• Numbers and dollar amounts
+• Badge values (Gold/Silver/Bronze/Red)
+• VIN numbers, dates
+
+THIS LANGUAGE REQUIREMENT OVERRIDES ALL "REQUIRED Title" AND "REQUIRED Message Format" SPECIFICATIONS.
+Write fluently and naturally in {language}. NO ENGLISH TEXT IN FLAGS OR NARRATIVES."""
+                },
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {"role": "user", "content": content}
+            ],
+            "temperature": 0.0,
+            "seed": 42,
+            "top_p": 1,
             "max_tokens": 4096,
-            "seed": 42
+            "response_format": {"type": "json_object"}
         }
 
         try:
@@ -645,7 +1356,7 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                     "state": None,
                     "region": "Outside US",
                     "badge": "Bronze",
-                    "sale_price": None,
+                    "selling_price": None,
                     "vin_number": None,
                     "date": None,
                     "buyer_message": "Analysis completed",
@@ -831,6 +1542,30 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                 parsed[flag_array_name] = normalized_flags
         
         return parsed
+
+    def _normalize_flag_scores(self, parsed: dict) -> dict:
+        """
+        Normalize score fields to deduction/bonus and force positive values.
+        """
+        if "red_flags" in parsed and isinstance(parsed["red_flags"], list):
+            for flag in parsed["red_flags"]:
+                if not isinstance(flag, dict):
+                    continue
+                if "score_impact" in flag and flag.get("deduction") is None:
+                    flag["deduction"] = abs(flag.get("score_impact", 0))
+                if flag.get("deduction") is not None:
+                    flag["deduction"] = abs(flag["deduction"])
+
+        if "green_flags" in parsed and isinstance(parsed["green_flags"], list):
+            for flag in parsed["green_flags"]:
+                if not isinstance(flag, dict):
+                    continue
+                if "score_impact" in flag and flag.get("bonus") is None:
+                    flag["bonus"] = abs(flag.get("score_impact", 0))
+                if flag.get("bonus") is not None:
+                    flag["bonus"] = abs(flag["bonus"])
+
+        return parsed
     
     def _advanced_json_repair(self, json_str: str) -> str:
         """
@@ -953,6 +1688,64 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             print(f"[DEBUG] Advanced JSON repair failed: {str(e)}")
             return json_str
     
+    def _call_narrative_api(self, parsed: dict, score: float, red_flags: list, green_flags: list, blue_flags: list, language: str) -> dict:
+        """Call OpenAI to generate narrative sections from the full parsed data and final flags."""
+        flags_payload = {
+            "red_flags": [{"type": f.type, "message": f.message, "item": f.item, "deduction": f.deduction} for f in red_flags],
+            "green_flags": [{"type": f.type, "message": f.message, "item": f.item, "bonus": f.bonus} for f in green_flags],
+            "blue_flags": [{"type": f.type, "message": f.message, "item": f.item} for f in blue_flags],
+        }
+        clean_data = {k: v for k, v in parsed.items() if k not in ("red_flags", "green_flags", "blue_flags", "narrative")}
+        prompt = f"""You are a SmartBuyer automotive finance analyst. A customer has submitted their contract data for analysis.
+Generate a detailed, personalized narrative review based on the EXACT data, score, and flags below.
+
+FINAL SCORE: {score}
+
+ALL FLAGS (Python-generated, authoritative):
+{json.dumps(flags_payload, indent=2)}
+
+FULL CONTRACT / DEAL DATA (everything the customer sent):
+{json.dumps(clean_data, indent=2)}
+
+INSTRUCTIONS:
+- Write ALL narrative text in {language}.
+- Reference specific numbers from the data (APR %, doc fee amounts, selling price, MSRP, add-on costs, etc.).
+- Explain every red flag deduction and green flag bonus in score_breakdown.
+- Be direct and specific — no generic filler text.
+- smartbuyer_score_summary MUST mention the final score {score} and summarize the deal quality.
+- score_breakdown MUST show exactly how {score} was reached (start 100, list each deduction/bonus).
+- gap_logic: explain if GAP is present, priced fairly, or missing and why it matters.
+- vsc_logic: explain if VSC/warranty is present and whether it's priced fairly.
+- apr_bonus_rule: explain the APR/rate and whether it's favorable or concerning.
+- lease_audit: write 'N/A - Purchase Agreement' if not a lease, otherwise analyze lease terms.
+- trade: describe trade-in situation if applicable, or 'No trade-in on this deal.'
+- market_comparison: compare this deal's pricing to market norms.
+- negotiation_insight: give specific actionable negotiation tips based on the actual flags.
+- final_recommendation: give a clear, honest recommendation based on the score and flags.
+- buyer_message: a short 1-sentence summary for the buyer (direct, personalized).
+
+Return ONLY a JSON object with exactly these keys:
+{{"narrative": {{"vehicle_overview": "", "smartbuyer_score_summary": "", "score_breakdown": "", "market_comparison": "", "gap_logic": "", "vsc_logic": "", "apr_bonus_rule": "", "lease_audit": "", "trade": "", "negotiation_insight": "", "final_recommendation": ""}}, "buyer_message": ""}}"""
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "You are a SmartBuyer automotive finance expert. Always write in the specified language. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.4,
+            "max_tokens": 2000,
+            "response_format": {"type": "json_object"}
+        }
+        try:
+            response = requests.post(self.api_url, headers=headers, json=payload, timeout=self.API_TIMEOUT)
+            response.raise_for_status()
+            raw = self._parse_json_object(response.json())
+            return raw
+        except Exception as e:
+            print(f"Narrative API call failed: {e}")
+            return {}
+
     def _assign_badge(self, score: float) -> str:
         """Assign badge based on score"""
         if score >= 90:
@@ -965,8 +1758,20 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             return "Red"
             
     def _normalize_line_items(self, line_items: List[Dict]) -> List[NormalizedLineItem]:
-        """Normalize line items for analysis (placeholder)"""
-        return [NormalizedLineItem(**item) for item in line_items if isinstance(item, dict)]
+        """Normalize OCR line items using the OCR normalizer before scoring."""
+        normalized = []
+        for item in line_items:
+            if not isinstance(item, dict):
+                continue
+            raw_text = item.get("description", "") or item.get("item", "") or item.get("name", "")
+            amount_raw = str(item.get("amount", "0"))
+            if raw_text:
+                normalized_item = self.ocr_normalizer.normalize_line_item(
+                    raw_text=raw_text,
+                    amount_raw=amount_raw
+                )
+                normalized.append(normalized_item)
+        return normalized
 
     async def _optimize_images(self, files: List[UploadFile]) -> List[UploadFile]:
         """Optimize images (placeholder)"""
@@ -977,6 +1782,57 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         Extract trade data using simple keyword detection from OCR text.
         """
         from .multi_image_analysis_schema import TradeData
+
+        def _coerce_float(value):
+            try:
+                if value is None or value == "":
+                    return None
+                return float(str(value).replace(",", ""))
+            except (ValueError, TypeError):
+                return None
+
+        # Prefer explicit extracted fields if present
+        trade_obj = parsed.get("trade") if isinstance(parsed.get("trade"), dict) else {}
+        pricing = parsed.get("normalized_pricing", {})
+
+        trade_allowance = _coerce_float(parsed.get("trade_allowance"))
+        if trade_allowance is None:
+            trade_allowance = _coerce_float(trade_obj.get("trade_allowance"))
+
+        trade_payoff = _coerce_float(parsed.get("trade_payoff"))
+        if trade_payoff is None:
+            trade_payoff = _coerce_float(trade_obj.get("trade_payoff"))
+
+        equity = _coerce_float(parsed.get("equity"))
+        if equity is None:
+            equity = _coerce_float(trade_obj.get("equity"))
+
+        negative_equity_amount = _coerce_float(parsed.get("negative_equity"))
+        if negative_equity_amount is None:
+            negative_equity_amount = _coerce_float(trade_obj.get("negative_equity"))
+
+        # Also parse narrative.trade text if present (common when model writes amounts only in narrative)
+        narrative_trade = ""
+        if isinstance(parsed.get("narrative"), dict):
+            narrative_trade = parsed.get("narrative", {}).get("trade") or ""
+        if narrative_trade and isinstance(narrative_trade, str):
+            narrative_lower = narrative_trade.lower()
+            money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
+
+            if trade_allowance is None and "allowance" in narrative_lower:
+                match = re.search(money_pattern, narrative_trade)
+                if match:
+                    trade_allowance = _coerce_float(match.group(1))
+
+            if trade_payoff is None and "payoff" in narrative_lower:
+                match = re.search(money_pattern, narrative_trade)
+                if match:
+                    trade_payoff = _coerce_float(match.group(1))
+
+            if negative_equity_amount is None and ("negative equity" in narrative_lower or "negative" in narrative_lower):
+                match = re.search(money_pattern, narrative_trade)
+                if match:
+                    negative_equity_amount = _coerce_float(match.group(1))
         
         page_text = ""
         
@@ -1027,8 +1883,7 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         
         money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
         
-        trade_allowance = None
-        trade_payoff = None
+        # If explicit fields present, we already populated values above
         
         allowance_keywords = [
             "trade allowance", "allowance", "trade value",
@@ -1067,13 +1922,13 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                     except ValueError:
                         continue
         
-        equity = None
-        negative_equity_amount = None
         trade_status = "No trade identified"
         
         trade_present = (
-            trade_allowance is not None or 
+            trade_allowance is not None or
             trade_payoff is not None or
+            equity is not None or
+            negative_equity_amount is not None or
             trade_anchor_found
         )
         
@@ -1103,6 +1958,16 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         
         elif trade_payoff is not None:
             trade_status = f"Trade identified: ${trade_payoff:,.2f} payoff (allowance not found)"
+
+        elif negative_equity_amount is not None:
+            trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+
+        elif equity is not None:
+            if equity < 0:
+                negative_equity_amount = abs(equity)
+                trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+            elif equity > 0:
+                trade_status = f"Positive equity of ${equity:,.2f} applied to purchase"
         
         else:
             trade_status = "Trade mentioned in document (values not extracted)"
@@ -1115,45 +1980,244 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             status=trade_status
         )
     
-    async def analyze_images(self, files: List[UploadFile]) -> 'MultiImageAnalysisResponse':
-        """Main analysis entry point"""
+    async def analyze_images(self, files: List[UploadFile] = None, language: str = "English", base64_images: List[str] = None, parsed_data: dict = None) -> 'MultiImageAnalysisResponse':
+        """Main analysis entry point. Accepts files, base64_images, or pre-extracted parsed_data dict."""
         try:
-            validated_files = await self._validate_files(files)
-            if not validated_files:
-                raise ValueError("No valid image files provided")
-            
-            base64_images = await self._convert_files_to_base64(validated_files)
-            api_response = self._call_openai_api(base64_images)
-            parsed = self._parse_api_response(api_response)
-            
-            # VALIDATE SCORE CONSISTENCY
-            score_raw = parsed.get("score")
-            score = float(score_raw) if score_raw is not None else 75.0
-            
-            # ENFORCE SCORE BOUNDS (critical for consistency)
-            score = max(0.0, min(100.0, score))
-            
-            # VALIDATE SCORE BREAKDOWN MATCHES (add this validation)
-            score_breakdown = parsed.get("narrative", {}).get("score_breakdown", "")
-            if score_breakdown:
-                # CRITICAL FIX: Ensure score_breakdown is a string
-                if isinstance(score_breakdown, list):
-                    score_breakdown = ' '.join(str(item) for item in score_breakdown)
-                elif not isinstance(score_breakdown, str):
-                    score_breakdown = str(score_breakdown)
+            if parsed_data is not None:
+                # Always run through converter for consistent structure
+                # Handles both nested (buyer_info, vehicle_details...) and flat formats
+                parsed = convert_extracted_json_to_parsed(parsed_data)
+            elif base64_images is None:
+                validated_files = await self._validate_files(files)
+                if not validated_files:
+                    raise ValueError("No valid image files provided")
                 
-                # Extract final score from breakdown
-                import re
-                final_match = re.search(r'Final Score:\s*(\d+(?:\.\d+)?)', score_breakdown)
-                if final_match:
-                    breakdown_score = float(final_match.group(1))
-                    # Allow 0.5 point tolerance for rounding
-                    if abs(breakdown_score - score) > 0.5:
-                        # Log warning but don't fail
-                        print(f"WARNING: Score mismatch - API returned {score}, breakdown shows {breakdown_score}")
-                        # Use the breakdown score as authoritative
-                        score = max(0.0, min(100.0, breakdown_score))
+                base64_images = await self._convert_files_to_base64(validated_files)
+                api_response = self._call_openai_api(base64_images, language=language)
+                parsed = self._parse_api_response(api_response)
+            else:
+                base64_images = [img.split(",", 1)[1] if img.startswith("data:") and "," in img else img for img in base64_images]
+                api_response = self._call_openai_api(base64_images, language=language)
+                parsed = self._parse_api_response(api_response)
             
+            # Normalize flag fields and scores
+            parsed = self._normalize_flag_fields(parsed)
+            parsed = self._normalize_flag_scores(parsed)
+
+            # Ensure selling_price is populated
+            if parsed.get("selling_price") is None:
+                normalized_pricing = parsed.get("normalized_pricing", {}) if isinstance(parsed.get("normalized_pricing"), dict) else {}
+                parsed["selling_price"] = normalized_pricing.get("selling_price")
+            if parsed.get("selling_price") is None and parsed.get("sale_price") is not None:
+                parsed["selling_price"] = parsed.get("sale_price")
+            
+            # ── Deterministic Audit Pipeline (runs on ALL paths: image & JSON) ──
+            raw_line_items = parsed.get("line_items", [])
+            normalized_line_items = self._normalize_line_items(raw_line_items)
+
+            discounts, discount_totals = self.discount_detector.process_line_items(
+                normalized_line_items,
+                mode="QUOTE"
+            )
+
+            vehicle_price = float(parsed.get("selling_price") or 0)
+            audit_classifications: List[AuditClassification] = []
+            for item in normalized_line_items:
+                classification = self.audit_classifier.classify_for_audit(
+                    item,
+                    vehicle_price=vehicle_price
+                )
+                audit_classifications.append(classification)
+
+            audit_flags: List[AuditFlag] = []
+            total_audit_penalty = 0
+
+            # Finance Certificate flags
+            finance_certs = [c for c in audit_classifications if c.classification == "CONDITIONAL_FINANCE_INCENTIVE"]
+            for cert in finance_certs:
+                flag = self.flag_builder.build_finance_certificate_flag(cert)
+                audit_flags.append(flag)
+                total_audit_penalty += cert.penalty_points
+
+            # Bundled package flags
+            bundles = [c for c in audit_classifications if c.classification == "BUNDLED_ADDON_PACKAGE"]
+            for bundle in bundles:
+                flag = self.flag_builder.build_bundled_package_flag(bundle)
+                audit_flags.append(flag)
+                total_audit_penalty += bundle.penalty_points
+
+            # Discount advantage flags (green)
+            if discount_totals.total_all_discounts < 0:
+                flag = self.flag_builder.build_online_price_advantage_flag(
+                    abs(discount_totals.total_all_discounts)
+                )
+                audit_flags.append(flag)
+
+            # GAP Logic Evaluation
+            term_months = parsed.get("term", {}).get("months")
+            down_payment = parsed.get("normalized_pricing", {}).get("down_payment")
+            amount_financed = parsed.get("normalized_pricing", {}).get("amount_financed")
+            gap_present = any(c.classification == "GAP" for c in audit_classifications)
+            has_backend = any(c.classification in ["GAP", "VSC", "MAINTENANCE"] for c in audit_classifications)
+
+            gap_recommendation = self.gap_logic.evaluate_gap_need(
+                is_used=True,
+                term_months=term_months,
+                down_payment=down_payment,
+                amount_financed=amount_financed,
+                vehicle_price=vehicle_price,
+                has_backend_products=has_backend,
+                gap_present=gap_present
+            )
+            if gap_recommendation.recommended:
+                audit_flags.append(self.flag_builder.build_gap_advisory_flag(gap_recommendation.message))
+
+            # Long-term loan risk flag
+            if term_months and term_months >= 72:
+                audit_flags.append(self.flag_builder.build_long_term_loan_risk_flag(term_months))
+
+            # APR Scoring
+            apr_data = parsed.get("apr", {})
+            if isinstance(apr_data, dict):
+                apr_rate = apr_data.get("rate")
+                try:
+                    if apr_rate is not None:
+                        apr_f = float(apr_rate)
+                        if apr_f > 0:
+                            if apr_f <= 4.9:
+                                audit_flags.append(AuditFlag(
+                                    type="green", category="Excellent APR",
+                                    message=f"APR of {apr_f:.2f}% is excellent — well below market average.",
+                                    item="APR", deduction=None, bonus=5
+                                ))
+                            elif apr_f <= 6.9:
+                                audit_flags.append(AuditFlag(
+                                    type="green", category="Good APR",
+                                    message=f"APR of {apr_f:.2f}% is competitive.",
+                                    item="APR", deduction=None, bonus=2
+                                ))
+                            elif apr_f >= 16.0:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="Predatory APR",
+                                    message=f"APR of {apr_f:.2f}% is predatory and significantly above market rates.",
+                                    item="APR", deduction=10, bonus=None
+                                ))
+                            elif apr_f > 12.0:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="High APR",
+                                    message=f"APR of {apr_f:.2f}% exceeds typical market rates.",
+                                    item="APR", deduction=5, bonus=None
+                                ))
+                except (ValueError, TypeError):
+                    pass
+
+            # Doc Fee Scoring
+            doc_fee = None
+            for _item in normalized_line_items:
+                raw = (_item.raw_text or "").lower()
+                if "documentary" in raw or "doc fee" in raw or "documentation fee" in raw:
+                    doc_fee = abs(_item.amount_normalized)
+                    break
+            if doc_fee is None:
+                for _key in ("doc_fee", "documentation_fee"):
+                    _v = parsed.get(_key)
+                    if _v is not None:
+                        try:
+                            doc_fee = abs(float(str(_v).replace(",", "").replace("$", "")))
+                        except (ValueError, TypeError):
+                            pass
+                        break
+            if doc_fee is not None:
+                if doc_fee > 899:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="Excessive Doc Fee",
+                        message=f"Documentation fee of ${doc_fee:,.2f} exceeds the recommended $899 cap.",
+                        item="Doc Fee", deduction=3, bonus=None
+                    ))
+                elif doc_fee > 599:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="SOFT - High Doc Fee",
+                        message=f"Documentation fee of ${doc_fee:,.2f} is above the $599 standard.",
+                        item="Doc Fee", deduction=2, bonus=None
+                    ))
+
+            # Amount Financed vs Selling Price check (loan-to-value)
+            _financed = None
+            try:
+                _raw_financed = parsed.get("normalized_pricing", {}).get("amount_financed") if isinstance(parsed.get("normalized_pricing"), dict) else None
+                if _raw_financed is not None:
+                    _financed = float(_raw_financed)
+            except (ValueError, TypeError):
+                pass
+            if _financed and vehicle_price and vehicle_price > 0:
+                ltv = (_financed / vehicle_price) * 100
+                if ltv > 115:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="High Loan-to-Value",
+                        message=f"Amount financed (${_financed:,.2f}) is {ltv:.0f}% of selling price — high loan-to-value ratio.",
+                        item="Financing", deduction=5, bonus=None
+                    ))
+                elif ltv > 105:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="SOFT - Elevated Loan-to-Value",
+                        message=f"Amount financed (${_financed:,.2f}) slightly exceeds selling price ({ltv:.0f}% LTV).",
+                        item="Financing", deduction=2, bonus=None
+                    ))
+
+            # MSRP vs selling price check
+            np_data = parsed.get("normalized_pricing", {}) if isinstance(parsed.get("normalized_pricing"), dict) else {}
+            msrp = np_data.get("msrp")
+            if msrp and vehicle_price:
+                try:
+                    msrp_f = float(str(msrp).replace(",", "").replace("$", ""))
+                    if msrp_f > 0:
+                        markup_pct = ((vehicle_price - msrp_f) / msrp_f) * 100
+                        if markup_pct > 5:
+                            audit_flags.append(AuditFlag(
+                                type="red", category="Above MSRP",
+                                message=f"Selling price ${vehicle_price:,.2f} is {markup_pct:.1f}% above MSRP ${msrp_f:,.2f}.",
+                                item="Pricing", deduction=5, bonus=None
+                            ))
+                        elif markup_pct < -3:
+                            audit_flags.append(AuditFlag(
+                                type="green", category="Below MSRP",
+                                message=f"Selling price is {abs(markup_pct):.1f}% below MSRP — good deal.",
+                                item="Pricing", deduction=None, bonus=3
+                            ))
+                        # Backend add-on overload check
+                        total_backend = sum(
+                            c.amount
+                            for c in audit_classifications
+                            if c.classification in ("GAP", "VSC", "MAINTENANCE", "TIRE_WHEEL_PROTECTION", "UNKNOWN")
+                            and c.amount > 0
+                        )
+                        if total_backend > 0:
+                            backend_pct = (total_backend / msrp_f) * 100
+                            if backend_pct > 20:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="Backend Overload",
+                                    message=f"Total backend products ${total_backend:,.2f} ({backend_pct:.1f}% of MSRP) — excessive.",
+                                    item="Add-ons", deduction=10, bonus=None
+                                ))
+                            elif backend_pct > 12:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="Backend Overload",
+                                    message=f"Total backend products ${total_backend:,.2f} ({backend_pct:.1f}% of MSRP) — above normal.",
+                                    item="Add-ons", deduction=5, bonus=None
+                                ))
+                except (ValueError, TypeError):
+                    pass
+
+            # Trade data extraction & negative equity flag
+            trade_data = self._extract_trade_data(parsed)
+            if trade_data and trade_data.negative_equity and trade_data.negative_equity > 0:
+                audit_flags.append(AuditFlag(
+                    type="blue", category="Negative Equity Alert",
+                    message=f"Rolled negative equity of ${trade_data.negative_equity:,.2f} increases amount financed.",
+                    item="Trade", deduction=None, bonus=None
+                ))
+
+            # ── Parse existing flags from parsed dict ──
             # Safe flag parsing with validation
             def parse_flags(flags_data):
                 if not flags_data:
@@ -1174,14 +2238,51 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             red_flags = parse_flags(parsed.get("red_flags", []))
             green_flags = parse_flags(parsed.get("green_flags", []))
             blue_flags = parse_flags(parsed.get("blue_flags", []))
+
+            # Merge audit-generated flags into the flag arrays
+            for af in audit_flags:
+                flag_obj = Flag(
+                    type=af.type,
+                    message=af.message,
+                    item=af.item,
+                    deduction=af.deduction,
+                    bonus=af.bonus
+                )
+                if af.type == "red":
+                    red_flags.append(flag_obj)
+                elif af.type == "green":
+                    green_flags.append(flag_obj)
+                elif af.type == "blue":
+                    blue_flags.append(flag_obj)
+
+            # Deterministic score from all merged flags (red/green only)
+            score = 100.0
+            for f in red_flags:
+                if f.deduction is not None:
+                    score -= abs(float(f.deduction))
+            for f in green_flags:
+                if f.bonus is not None:
+                    score += abs(float(f.bonus))
+            score = max(0.0, min(100.0, score))
+
+            # Validate score_breakdown vs computed score (log only)
+            score_breakdown = parsed.get("narrative", {}).get("score_breakdown", "")
+            if score_breakdown:
+                if isinstance(score_breakdown, list):
+                    score_breakdown = ' '.join(str(item) for item in score_breakdown)
+                elif not isinstance(score_breakdown, str):
+                    score_breakdown = str(score_breakdown)
+                import re
+                final_match = re.search(r'Final Score:\s*(\d+(?:\.\d+)?)', score_breakdown)
+                if final_match:
+                    breakdown_score = float(final_match.group(1))
+                    if abs(breakdown_score - score) > 0.5:
+                        print(f"WARNING: Score mismatch - computed {score}, breakdown shows {breakdown_score}")
             
-            # CRITICAL VALIDATION: All flag sections must be populated
-            if not red_flags:
-                raise ValueError("API failed to generate red_flags - all flag sections must be populated")
-            if not green_flags:
-                raise ValueError("API failed to generate green_flags - all flag sections must be populated")
-            if not blue_flags:
-                raise ValueError("API failed to generate blue_flags - all flag sections must be populated")
+            # Translate flags to requested language
+            red_flags = self._translate_flags(red_flags, language)
+            green_flags = self._translate_flags(green_flags, language)
+            blue_flags = self._translate_flags(blue_flags, language)
             
             # REMOVE DUPLICATE FLAG LOGIC - This causes inconsistency!
             # The VSC fair pricing logic below modifies flags AFTER API response
@@ -1201,9 +2302,6 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             #             item="VSC"
             #         ))
             
-            # Extract trade data
-            trade_data = self._extract_trade_data(parsed)
-            
             # REMOVE DUPLICATE NEGATIVE EQUITY FLAG - AI should handle this
             # if trade_data.negative_equity and trade_data.negative_equity > 0:
             #     blue_flags.append(Flag(
@@ -1217,42 +2315,46 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             # if not red_flags:
             #     red_flags.append(...)
             
-            # Handle buyer_message explicitly to prevent NoneType error
-            buyer_msg = parsed.get("buyer_message")
-            if buyer_msg is None:
-                buyer_msg = "Analysis completed"
-            
-            # Ensure narrative has all required fields with defaults
-            narrative_data = parsed.get("narrative")
+            # ── AI Narrative Generation ──
+            # Pass full parsed data + final flags to AI for rich, personalized narrative
+            print(f"Generating AI narrative for score {score}...")
+            ai_result = self._call_narrative_api(parsed, score, red_flags, green_flags, blue_flags, language)
+            narrative_data = ai_result.get("narrative", {}) if isinstance(ai_result, dict) else {}
             if not isinstance(narrative_data, dict):
                 narrative_data = {}
-            
-            # CRITICAL FIX: Ensure usage of narrative['trade'] is a string, not a dict
-            if "trade" in narrative_data and not isinstance(narrative_data["trade"], str):
-                if isinstance(narrative_data["trade"], dict):
-                     trade_obj = narrative_data["trade"]
-                     narrative_data["trade"] = trade_obj.get("status") or trade_obj.get("description") or str(trade_obj)
-                else:
-                     narrative_data["trade"] = str(narrative_data["trade"])
-                
+            buyer_msg = ai_result.get("buyer_message") if isinstance(ai_result, dict) else None
+
+            # Normalize legacy key
+            if "trust_score_summary" in narrative_data and "smartbuyer_score_summary" not in narrative_data:
+                narrative_data["smartbuyer_score_summary"] = narrative_data.pop("trust_score_summary")
+
+            # Fallback defaults for any fields the AI left empty
             narrative_defaults = {
-                "vehicle_overview": "Vehicle details extracted.",
-                "smartbuyer_score_summary": f"Score calculated at {score}",
-                "score_breakdown": f"Score breakdown: Final Score: {score}",
-                "market_comparison": "Standard market rates applied.",
-                "gap_logic": "GAP coverage analysis applied.",
-                "vsc_logic": "VSC analysis applied.",
-                "apr_bonus_rule": "APR verified.",
-                "lease_audit": "N/A",
-                "negotiation_insight": "Review identified flags.",
-                "final_recommendation": "Proceed with caution based on flags.",
-                "trade": trade_data.status if trade_data else "No trade identified."
+                "vehicle_overview": f"Deal analysis for {parsed.get('dealer_name', 'this dealer')}.",
+                "smartbuyer_score_summary": f"SmartBuyer Score: {score}/100.",
+                "score_breakdown": f"Final Score: {score}",
+                "market_comparison": "Market comparison pending.",
+                "gap_logic": "GAP analysis pending.",
+                "vsc_logic": "VSC analysis pending.",
+                "apr_bonus_rule": "APR analysis pending.",
+                "lease_audit": "N/A - Purchase Agreement",
+                "negotiation_insight": "Review all flags before signing.",
+                "final_recommendation": "Proceed with caution based on the flags above.",
+                "trade": trade_data.status if trade_data else "No trade-in on this deal."
             }
-            
-            # Apply defaults for missing keys or None values
             for key, default_val in narrative_defaults.items():
-                if key not in narrative_data or narrative_data[key] is None:
+                if not narrative_data.get(key):
                     narrative_data[key] = default_val
+
+            if not buyer_msg:
+                buyer_msg = f"Your SmartBuyer score is {score}/100 — review the flags above."
+
+            # Ensure trade is always a string
+            if "trade" in narrative_data and not isinstance(narrative_data["trade"], str):
+                narrative_data["trade"] = str(narrative_data["trade"])
+
+            if trade_data and narrative_data.get("trade"):
+                trade_data.status = narrative_data["trade"]
 
             return MultiImageAnalysisResponse(
                 score=score,
@@ -1263,10 +2365,9 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                 phone_number=parsed.get("phone_number"),
                 address=parsed.get("address"),
                 state=parsed.get("state"),
-                # CRITICAL FIX: handle explicit None for region
                 region=parsed.get("region") or "Outside US",
                 badge=self._assign_badge(score),
-                sale_price=parsed.get("sale_price"),
+                selling_price=parsed.get("selling_price"),
                 vin_number=parsed.get("vin_number"),
                 date=parsed.get("date"),
                 buyer_message=buyer_msg,
@@ -1282,3 +2383,4 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             )
         except Exception as e:
             raise RuntimeError(f"Contract analysis failed: {str(e)}")
+

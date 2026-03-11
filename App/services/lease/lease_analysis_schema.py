@@ -23,6 +23,8 @@ class APRData(BaseModel):
     rate: Optional[float] = None
     estimated: bool = False
     money_factor: Optional[float] = None
+    validation_status: str = "unvalidated"
+    payment_variance: Optional[float] = None
 
 class TermData(BaseModel):
     months: Optional[int] = None
@@ -46,8 +48,9 @@ class Narrative(BaseModel):
     negotiation_insight: str
     final_recommendation: str
 
-class LeaseAnalysisRequest(BaseModel):
-    analysis_type: str = Field(default="lease_quality", description="Type of lease analysis")
+class LeaseJsonRequest(BaseModel):
+    data: dict = Field(..., description="Pre-extracted JSON data for lease analysis")
+    language: str = Field(default="English", description="Language for narrative parts")
 
 class LeaseAnalysisResponse(BaseModel):
     score: float = Field(..., description="Overall score 0-100")

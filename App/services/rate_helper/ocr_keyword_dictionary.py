@@ -70,6 +70,34 @@ class OCRKeywordDictionary:
                 default_sign="+",
                 priority_rank=2
             ),
+            KeywordPattern(
+                pattern="debt cancellation agreement",
+                normalized_category="GAP",
+                normalized_label="GAP Insurance",
+                default_sign="+",
+                priority_rank=2
+            ),
+            KeywordPattern(
+                pattern="dca",
+                normalized_category="GAP",
+                normalized_label="GAP Insurance",
+                default_sign="+",
+                priority_rank=2
+            ),
+            KeywordPattern(
+                pattern="loan/lease payoff protection",
+                normalized_category="GAP",
+                normalized_label="GAP Insurance",
+                default_sign="+",
+                priority_rank=2
+            ),
+            KeywordPattern(
+                pattern="debt protection",
+                normalized_category="GAP",
+                normalized_label="GAP Insurance",
+                default_sign="+",
+                priority_rank=2
+            ),
             
             # PRIORITY 3: VSC / Warranty
             KeywordPattern(

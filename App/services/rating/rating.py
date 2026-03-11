@@ -18,6 +18,7 @@ from App.services.rate_helper.audit_classifier import AuditClassifier, AuditClas
 from App.services.rate_helper.gap_logic import GAPLogic, GAPRecommendation
 from App.services.rate_helper.audit_flags import AuditFlagBuilder, AuditFlag
 from App.services.rate_helper.audit_summary import AuditSummary
+from App.services.rate_helper.json_to_parsed import convert_extracted_json_to_parsed
 
 load_dotenv()
 
@@ -31,7 +32,7 @@ class MultiImageAnalyzer:
     
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = os.getenv("GROQ_MODEL", "gpt-4.1-mini")
+        self.model = os.getenv("GROQ_MODEL", "gpt-4.1")
         self.api_url = "https://api.openai.com/v1/chat/completions"
         self.system_prompt = self._load_contract_system_prompt()
         self.ocr_normalizer = OCRNormalizer()
@@ -39,6 +40,101 @@ class MultiImageAnalyzer:
         self.audit_classifier = AuditClassifier()
         self.gap_logic = GAPLogic()
         self.flag_builder = AuditFlagBuilder()
+
+    def _get_cache_dir(self) -> str:
+        """Return cache directory for deterministic flag translations."""
+        cache_dir = os.path.join(os.getcwd(), "App", "core", ".rating_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _make_flags_cache_key(self, language: str, flags_payload: list) -> str:
+        """Create a stable cache key for flag translation."""
+        import hashlib
+        hasher = hashlib.sha256()
+        hasher.update(language.lower().encode("utf-8"))
+        hasher.update(json.dumps(flags_payload, sort_keys=True).encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _load_cached_flag_translation(self, cache_key: str) -> Optional[dict]:
+        """Load cached flag translation JSON if available."""
+        cache_path = os.path.join(self._get_cache_dir(), f"flags_{cache_key}.json")
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_cached_flag_translation(self, cache_key: str, translated: dict) -> None:
+        """Persist flag translation JSON to cache for future reuse."""
+        cache_path = os.path.join(self._get_cache_dir(), f"flags_{cache_key}.json")
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(translated, f)
+        except Exception:
+            pass
+
+    def _translate_flags(self, flags: List[Flag], language: str) -> List[Flag]:
+        """Translate flag text fields to the requested language (no scoring changes)."""
+        if not language or language.lower() == "english":
+            return flags
+
+        flags_payload = [
+            {"type": f.type, "message": f.message, "item": f.item}
+            for f in flags
+        ]
+
+        cache_key = self._make_flags_cache_key(language, flags_payload)
+        cached = self._load_cached_flag_translation(cache_key)
+        if cached and isinstance(cached, dict) and isinstance(cached.get("flags"), list):
+            translated_list = cached.get("flags")
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Translate the flag fields to the target language. Return JSON only with key 'flags'. Preserve structure and order."
+                },
+                {
+                    "role": "user",
+                    "content": f"Target language: {language}. Translate each object's 'type', 'message', and 'item'. Input JSON: {{\"flags\": {json.dumps(flags_payload)}}}"
+                }
+            ]
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0.0,
+                "seed": 42,
+                "max_tokens": 1000,
+                "response_format": {"type": "json_object"}
+            }
+            response = requests.post(self.api_url, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+            parsed_translation = self._parse_api_response(response.json())
+            translated_list = parsed_translation.get("flags", []) if isinstance(parsed_translation, dict) else []
+            self._save_cached_flag_translation(cache_key, {"flags": translated_list})
+
+        if not isinstance(translated_list, list) or len(translated_list) != len(flags):
+            return flags
+
+        translated_flags: List[Flag] = []
+        for original, translated in zip(flags, translated_list):
+            if not isinstance(translated, dict):
+                translated_flags.append(original)
+                continue
+            translated_flags.append(Flag(
+                type=translated.get("type", original.type),
+                message=translated.get("message", original.message),
+                item=translated.get("item", original.item),
+                deduction=original.deduction,
+                bonus=original.bonus
+            ))
+
+        return translated_flags
     
     def _load_contract_system_prompt(self) -> str:
         """Load comprehensive contract analysis system prompt"""
@@ -169,6 +265,41 @@ Always output these as BLUE FLAGS when conditions are met:
 - APR > 10%: "Rate Advisory: Consider if better financing options are available"
 - Unknown line items: "Clarification Needed: Item not clearly defined in quote"
 
+### FLAG STRUCTURE REQUIREMENTS
+
+Each flag MUST be a JSON object with these fields:
+```json
+{
+  "type": "Brief descriptive title",
+  "message": "Detailed explanation",
+  "item": "Category (e.g., GAP, VSC, APR, Trade, Fees)",
+  "deduction": 10.0,  // ONLY for red_flags
+  "bonus": 5.0        // ONLY for green_flags
+}
+```
+
+**GREEN FLAGS - Generate when positive aspects are found:**
+- Transparent itemization: All fees and products clearly listed
+- Competitive APR: Rate below market average
+- Reasonable fees: Documentation fees within acceptable range
+- Fair pricing: Products priced appropriately
+- Positive trade equity: Trade value exceeds payoff
+- Clear disclosure: All terms clearly presented
+
+**RED FLAGS - Generate for issues and violations:**
+- Poor transparency: Missing itemization or bundled items
+- High fees: Documentation fees exceeding reasonable limits
+- High APR: Interest rates above market norms
+- Negative equity: Trade payoff exceeds allowance
+- Payment misalignment: Calculations don't match
+
+**BLUE FLAGS - Advisory only, zero score impact:**
+- APR 10-15%: Higher than ideal but not excessive
+- Extended term: Loans over 72 months
+- Missing information: Items that need clarification
+
+**CRITICAL: All flag arrays (red_flags, green_flags, blue_flags) MUST contain at least one flag. Never return empty arrays.**
+
 ### SCORE CEILINGS (CREDIBILITY GUARDS)
 Applied after penalties & bonuses:
 - Negative equity: Max Score 95
@@ -287,15 +418,15 @@ Output MUST be valid JSON with exactly these TOP-LEVEL FIELDS:
 
 The "narrative" object MUST have EXACTLY these fields:
 - vehicle_overview
-- smartbuyer_score_summary (NOT "trust_score_summary")
+- smartbuyer_score_summary ( Include how the score was calculated. Include every bonus and penalty in the explanation, even if the bonus/penalty is $0.00. If a negative equity structural adjustment was applied, include a clear explanation of the adjustment and its rationale.)
 - market_comparison
 - gap_logic
 - vsc_logic
 - apr_bonus_rule
 - lease_audit
 - trade (REQUIRED - cannot be omitted)
-- negotiation_insight
-- final_recommendation
+- negotiation_insight (Provide analytical guide on how to negotiate regarding tghis deal.)
+- final_recommendation (Reccomend about what to do, but do not be directly conclusive.)
 
 ### EXECUTION CHECKLIST
 □ Start score at 100
@@ -363,7 +494,7 @@ Before returning JSON:
         
         return normalized
     
-    def _call_openai_api(self, base64_images: List[str]) -> dict:
+    def _call_openai_api(self, base64_images: List[str], language: str = "English") -> dict:
         """Call OpenAI API with contract documents (with retry logic)"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -374,6 +505,18 @@ Before returning JSON:
             {
                 "type": "text",
                 "text": f"""
+{'=' * 80}
+LANGUAGE REQUIREMENT: ALL narrative text fields MUST be in {language}
+{'=' * 80}
+
+Translate to {language}:
+- ALL narrative fields (vehicle_overview, smartbuyer_score_summary, score_breakdown, market_comparison, gap_logic, vsc_logic, apr_bonus_rule, trade, negotiation_insight, final_recommendation)
+- ALL flag messages (red_flags, green_flags, blue_flags)
+- buyer_message field
+
+KEEP in English ONLY: JSON keys, field names, numbers, dates, VIN, badge values.
+{'=' * 80}
+
 Analyze these contract documents comprehensively.
 
 {self.system_prompt}
@@ -400,22 +543,60 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         ]
         
         # Optimize image quality if multiple images
-        image_detail = "high" if len(base64_images) <= 2 else "auto"
+        image_detail = "high" if base64_images and len(base64_images) <= 2 else "auto"
         
-        for base64_image in base64_images:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}",
-                    "detail": image_detail  # Use auto for >2 images to reduce processing time
-                }
-            })
+        if base64_images:
+            for base64_image in base64_images:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}",
+                        "detail": image_detail  # Use auto for >2 images to reduce processing time
+                    }
+                })
         
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0,
-            "max_tokens": 3000
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"""!!!CRITICAL - LANGUAGE REQUIREMENT - HIGHEST PRIORITY!!!
+
+OUTPUT LANGUAGE: {language}
+
+You will see system instructions with English examples like:
+- "Significant Negative Trade Equity"
+- "High-Risk Financing Without GAP"
+- "Reasonable Documentation Fee"
+- "VSC within fair market value"
+- "Trade value appears fair"
+
+YOU MUST TRANSLATE ALL OF THESE TO {language}. They are examples only.
+
+TRANSLATE EVERY PIECE OF TEXT:
+• Every flag "type" → {language}
+• Every flag "message" → {language}
+• Every narrative section → {language}
+• buyer_message → {language}
+
+ONLY KEEP IN ENGLISH:
+• JSON structure keys
+• Numbers and amounts
+• Badge (Gold/Silver/Bronze/Red)
+• VIN, dates
+
+The system instructions may say "REQUIRED Title:" with English text - TRANSLATE IT TO {language}.
+Write fluently and naturally in {language}. This overrides all other instructions."""
+                },
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {"role": "user", "content": content}
+            ],
+            "temperature": 0.9,
+            "max_tokens": 3000,
+            "response_format": {"type": "json_object"}
         }
         
         # Retry logic for timeout errors
@@ -472,6 +653,65 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             raise RuntimeError(f"Failed to parse API response: {str(e)}")
     
+    def _call_narrative_api(self, parsed: dict, score: float, red_flags: list, green_flags: list, blue_flags: list, language: str) -> dict:
+        """Call OpenAI to generate narrative sections from the full parsed data and final flags."""
+        flags_payload = {
+            "red_flags": [{"type": f.type, "message": f.message, "item": f.item, "deduction": f.deduction} for f in red_flags],
+            "green_flags": [{"type": f.type, "message": f.message, "item": f.item, "bonus": f.bonus} for f in green_flags],
+            "blue_flags": [{"type": f.type, "message": f.message, "item": f.item} for f in blue_flags],
+        }
+        # Pass full data so AI has complete context
+        clean_data = {k: v for k, v in parsed.items() if k not in ("red_flags", "green_flags", "blue_flags", "narrative")}
+        prompt = f"""You are a SmartBuyer automotive finance analyst. A customer has submitted their contract data for analysis.
+Generate a detailed, personalized narrative review based on the EXACT data, score, and flags below.
+
+FINAL SCORE: {score}
+
+ALL FLAGS (Python-generated, authoritative):
+{json.dumps(flags_payload, indent=2)}
+
+FULL CONTRACT / DEAL DATA (everything the customer sent):
+{json.dumps(clean_data, indent=2)}
+
+INSTRUCTIONS:
+- Write ALL narrative text in {language}.
+- Reference specific numbers from the data (APR %, doc fee amounts, selling price, MSRP, add-on costs, etc.).
+- Explain every red flag deduction and green flag bonus in score_breakdown.
+- Be direct and specific — no generic filler text.
+- smartbuyer_score_summary MUST mention the final score {score} and summarize the deal quality.
+- score_breakdown MUST show exactly how {score} was reached (start 100, list each deduction/bonus).
+- gap_logic: explain if GAP is present, priced fairly, or missing and why it matters.
+- vsc_logic: explain if VSC/warranty is present and whether it's priced fairly.
+- apr_bonus_rule: explain the APR/rate and whether it's favorable or concerning.
+- lease_audit: write 'N/A - Purchase Agreement' if not a lease, otherwise analyze lease terms.
+- trade: describe trade-in situation if applicable, or 'No trade-in on this deal.'
+- market_comparison: compare this deal's pricing to market norms.
+- negotiation_insight: give specific actionable negotiation tips based on the actual flags.
+- final_recommendation: give a clear, honest recommendation based on the score and flags.
+- buyer_message: a short 1-sentence summary for the buyer (direct, personalized).
+
+Return ONLY a JSON object with exactly these keys:
+{{"narrative": {{"vehicle_overview": "", "smartbuyer_score_summary": "", "score_breakdown": "", "market_comparison": "", "gap_logic": "", "vsc_logic": "", "apr_bonus_rule": "", "lease_audit": "", "trade": "", "negotiation_insight": "", "final_recommendation": ""}}, "buyer_message": ""}}"""
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "You are a SmartBuyer automotive finance expert. Always write in the specified language. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.4,
+            "max_tokens": 2000,
+            "response_format": {"type": "json_object"}
+        }
+        try:
+            response = requests.post(self.api_url, headers=headers, json=payload, timeout=self.API_TIMEOUT)
+            response.raise_for_status()
+            raw = self._parse_api_response(response.json())
+            return raw
+        except Exception as e:
+            print(f"Narrative API call failed: {e}")
+            return {}
+
     def _assign_badge(self, score: float) -> str:
         """Assign badge based on score"""
         if score >= 90:
@@ -532,6 +772,33 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         3. Calculate equity if both values present
         4. Always return a TradeData object (never None)
         """
+        def _coerce_float(value):
+            try:
+                if value is None or value == "":
+                    return None
+                return float(str(value).replace(",", ""))
+            except (ValueError, TypeError):
+                return None
+
+        # Prefer explicit extracted fields if present
+        trade_obj = parsed.get("trade") if isinstance(parsed.get("trade"), dict) else {}
+
+        trade_allowance = _coerce_float(parsed.get("trade_allowance"))
+        if trade_allowance is None:
+            trade_allowance = _coerce_float(trade_obj.get("trade_allowance"))
+
+        trade_payoff = _coerce_float(parsed.get("trade_payoff"))
+        if trade_payoff is None:
+            trade_payoff = _coerce_float(trade_obj.get("trade_payoff"))
+
+        equity = _coerce_float(parsed.get("equity"))
+        if equity is None:
+            equity = _coerce_float(trade_obj.get("equity"))
+
+        negative_equity_amount = _coerce_float(parsed.get("negative_equity"))
+        if negative_equity_amount is None:
+            negative_equity_amount = _coerce_float(trade_obj.get("negative_equity"))
+
         # Step 1: Get OCR text (from line items or raw text field)
         page_text = ""
         
@@ -555,16 +822,29 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         ]
         
         trade_anchor_found = any(anchor in page_text for anchor in trade_anchors)
-        
-        if not trade_anchor_found:
-            # No trade present - return default
-            return TradeData(
-                trade_allowance=None,
-                trade_payoff=None,
-                equity=None,
-                negative_equity=None,
-                status="No trade identified"
-            )
+
+        # Also parse narrative.trade text if present (often contains trade values)
+        narrative_trade = ""
+        if isinstance(parsed.get("narrative"), dict):
+            narrative_trade = parsed.get("narrative", {}).get("trade") or ""
+        if narrative_trade and isinstance(narrative_trade, str):
+            narrative_lower = narrative_trade.lower()
+            money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
+
+            if trade_allowance is None and "allowance" in narrative_lower:
+                match = re.search(money_pattern, narrative_trade)
+                if match:
+                    trade_allowance = _coerce_float(match.group(1))
+
+            if trade_payoff is None and "payoff" in narrative_lower:
+                match = re.search(money_pattern, narrative_trade)
+                if match:
+                    trade_payoff = _coerce_float(match.group(1))
+
+            if negative_equity_amount is None and ("negative equity" in narrative_lower or "negative" in narrative_lower):
+                match = re.search(money_pattern, narrative_trade)
+                if match:
+                    negative_equity_amount = _coerce_float(match.group(1))
         
         # Step B & C: Extract money values near trade keywords
         import re
@@ -572,8 +852,7 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         # Money pattern: $12,345.67 or 12345.67 or 12,345
         money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
         
-        trade_allowance = None
-        trade_payoff = None
+        # If explicit fields present, we already populated values above
         
         # Allowance keywords (priority order)
         allowance_keywords = [
@@ -617,14 +896,14 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                         continue
         
         # Step 6: Calculate equity (only if BOTH values exist)
-        equity = None
-        negative_equity_amount = None
         trade_status = "No trade identified"
         
         # Determine if trade is present
         trade_present = (
-            trade_allowance is not None or 
+            trade_allowance is not None or
             trade_payoff is not None or
+            equity is not None or
+            negative_equity_amount is not None or
             trade_anchor_found
         )
         
@@ -655,6 +934,16 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
         
         elif trade_payoff is not None:
             trade_status = f"Trade identified: ${trade_payoff:,.2f} payoff (allowance not found)"
+
+        elif negative_equity_amount is not None:
+            trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+
+        elif equity is not None:
+            if equity < 0:
+                negative_equity_amount = abs(equity)
+                trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+            elif equity > 0:
+                trade_status = f"Positive equity of ${equity:,.2f} applied to purchase"
         
         else:
             # Anchor found but no values extracted
@@ -668,20 +957,29 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             status=trade_status
         )
 
-    async def analyze_images(self, files: List[UploadFile]) -> MultiImageAnalysisResponse:
-        """Main analysis entry point"""
+    async def analyze_images(self, files: List[UploadFile] = None, language: str = "English", base64_images: List[str] = None, parsed_data: dict = None) -> MultiImageAnalysisResponse:
+        """Main analysis entry point. Accepts files, base64_images, or pre-extracted parsed_data dict."""
         try:
-            validated_files = await self._validate_files(files)
-            if not validated_files:
-                raise ValueError("No valid image files provided")
-            
-            # Optional: Optimize images before base64 encoding
-            # optimized_files = await self._optimize_images(validated_files)
-            # base64_images = await self._convert_files_to_base64(optimized_files)
-            
-            base64_images = await self._convert_files_to_base64(validated_files)
-            api_response = self._call_openai_api(base64_images)
-            parsed = self._parse_api_response(api_response)
+            if parsed_data is not None:
+                # Always run through converter for consistent structure
+                # Handles both nested (buyer_info, vehicle_details...) and flat formats
+                parsed = convert_extracted_json_to_parsed(parsed_data)
+            elif base64_images is None:
+                validated_files = await self._validate_files(files)
+                if not validated_files:
+                    raise ValueError("No valid image files provided")
+                
+                # Optional: Optimize images before base64 encoding
+                # optimized_files = await self._optimize_images(validated_files)
+                # base64_images = await self._convert_files_to_base64(optimized_files)
+                
+                base64_images = await self._convert_files_to_base64(validated_files)
+                api_response = self._call_openai_api(base64_images, language=language)
+                parsed = self._parse_api_response(api_response)
+            else:
+                base64_images = [img.split(",", 1)[1] if img.startswith("data:") and "," in img else img for img in base64_images]
+                api_response = self._call_openai_api(base64_images, language=language)
+                parsed = self._parse_api_response(api_response)
             
             # Step 1: OCR Normalization
             raw_line_items = parsed.get("line_items", [])
@@ -694,7 +992,7 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             )
             
             # Step 3: Audit Classification
-            vehicle_price = float(parsed.get("selling_price", 0))
+            vehicle_price = float(parsed.get("selling_price") or 0)
             audit_classifications: List[AuditClassification] = []
             
             for item in normalized_line_items:
@@ -769,7 +1067,139 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
             if term_months and term_months >= 72:
                 loan_risk_flag = self.flag_builder.build_long_term_loan_risk_flag(term_months)
                 audit_flags.append(loan_risk_flag)
-            
+
+            # APR Scoring
+            apr_data = parsed.get("apr", {})
+            if isinstance(apr_data, dict):
+                apr_rate = apr_data.get("rate")
+                try:
+                    if apr_rate is not None:
+                        apr_f = float(apr_rate)
+                        if apr_f > 0:
+                            if apr_f <= 4.9:
+                                audit_flags.append(AuditFlag(
+                                    type="green", category="Excellent APR",
+                                    message=f"APR of {apr_f:.2f}% is excellent — well below market average.",
+                                    item="APR", deduction=None, bonus=5
+                                ))
+                            elif apr_f <= 6.9:
+                                audit_flags.append(AuditFlag(
+                                    type="green", category="Good APR",
+                                    message=f"APR of {apr_f:.2f}% is competitive.",
+                                    item="APR", deduction=None, bonus=2
+                                ))
+                            elif apr_f >= 16.0:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="Predatory APR",
+                                    message=f"APR of {apr_f:.2f}% is predatory and significantly above market rates.",
+                                    item="APR", deduction=10, bonus=None
+                                ))
+                            elif apr_f > 12.0:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="High APR",
+                                    message=f"APR of {apr_f:.2f}% exceeds typical market rates.",
+                                    item="APR", deduction=5, bonus=None
+                                ))
+                except (ValueError, TypeError):
+                    pass
+
+            # Doc Fee Scoring
+            doc_fee = None
+            for _item in normalized_line_items:
+                raw = (_item.raw_text or "").lower()
+                if "documentary" in raw or "doc fee" in raw or "documentation fee" in raw:
+                    doc_fee = abs(_item.amount_normalized)
+                    break
+            if doc_fee is None:
+                for _key in ("doc_fee", "documentation_fee"):
+                    _v = parsed.get(_key)
+                    if _v is not None:
+                        try:
+                            doc_fee = abs(float(str(_v).replace(",", "").replace("$", "")))
+                        except (ValueError, TypeError):
+                            pass
+                        break
+            if doc_fee is not None:
+                if doc_fee > 899:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="Excessive Doc Fee",
+                        message=f"Documentation fee of ${doc_fee:,.2f} exceeds the recommended $899 cap.",
+                        item="Doc Fee", deduction=3, bonus=None
+                    ))
+                elif doc_fee > 599:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="SOFT - High Doc Fee",
+                        message=f"Documentation fee of ${doc_fee:,.2f} is above the $599 standard.",
+                        item="Doc Fee", deduction=2, bonus=None
+                    ))
+
+            # Amount Financed vs Selling Price check (loan-to-value)
+            _selling = vehicle_price
+            _financed = None
+            try:
+                _raw_financed = parsed.get("normalized_pricing", {}).get("amount_financed") if isinstance(parsed.get("normalized_pricing"), dict) else None
+                if _raw_financed is not None:
+                    _financed = float(_raw_financed)
+            except (ValueError, TypeError):
+                pass
+            if _financed and _selling and _selling > 0:
+                ltv = (_financed / _selling) * 100
+                if ltv > 115:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="High Loan-to-Value",
+                        message=f"Amount financed (${_financed:,.2f}) is {ltv:.0f}% of selling price — high loan-to-value ratio.",
+                        item="Financing", deduction=5, bonus=None
+                    ))
+                elif ltv > 105:
+                    audit_flags.append(AuditFlag(
+                        type="red", category="SOFT - Elevated Loan-to-Value",
+                        message=f"Amount financed (${_financed:,.2f}) slightly exceeds selling price ({ltv:.0f}% LTV).",
+                        item="Financing", deduction=2, bonus=None
+                    ))
+
+            # MSRP vs Selling Price check
+            np_data = parsed.get("normalized_pricing", {}) if isinstance(parsed.get("normalized_pricing"), dict) else {}
+            msrp_raw = np_data.get("msrp")
+            if msrp_raw and vehicle_price:
+                try:
+                    msrp_f = float(str(msrp_raw).replace(",", "").replace("$", ""))
+                    if msrp_f > 0:
+                        markup_pct = ((vehicle_price - msrp_f) / msrp_f) * 100
+                        if markup_pct > 5:
+                            audit_flags.append(AuditFlag(
+                                type="red", category="Above MSRP",
+                                message=f"Selling price ${vehicle_price:,.2f} is {markup_pct:.1f}% above MSRP ${msrp_f:,.2f}.",
+                                item="Pricing", deduction=5, bonus=None
+                            ))
+                        elif markup_pct < -3:
+                            audit_flags.append(AuditFlag(
+                                type="green", category="Below MSRP",
+                                message=f"Selling price is {abs(markup_pct):.1f}% below MSRP — good deal.",
+                                item="Pricing", deduction=None, bonus=3
+                            ))
+                        # Backend overload check
+                        total_backend = sum(
+                            c.amount for c in audit_classifications
+                            if c.classification in ("GAP", "VSC", "MAINTENANCE", "TIRE_WHEEL_PROTECTION", "UNKNOWN")
+                            and c.amount > 0
+                        )
+                        if total_backend > 0:
+                            backend_pct = (total_backend / msrp_f) * 100
+                            if backend_pct > 20:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="Backend Overload",
+                                    message=f"Total backend products ${total_backend:,.2f} ({backend_pct:.1f}% of MSRP) — excessive.",
+                                    item="Add-ons", deduction=10, bonus=None
+                                ))
+                            elif backend_pct > 12:
+                                audit_flags.append(AuditFlag(
+                                    type="red", category="Backend Overload",
+                                    message=f"Total backend products ${total_backend:,.2f} ({backend_pct:.1f}% of MSRP) — above normal.",
+                                    item="Add-ons", deduction=5, bonus=None
+                                ))
+                except (ValueError, TypeError):
+                    pass
+
             # Step 6.5: Process Trade Data (UPDATED - Use OCR-based extraction)
             trade_data = self._extract_trade_data(parsed)
             
@@ -791,10 +1221,7 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                 # (This would be in the original API response processing)
                 pass
             
-            # Step 7: Apply audit penalties to score
-            base_score = float(parsed.get("score", 75.0))
-            adjusted_score = base_score + total_audit_penalty
-            adjusted_score = max(0.0, min(100.0, adjusted_score))  # Clamp 0-100
+            # Step 7: Score will be computed AFTER merging all flags (see below)
             
             # Step 8: Merge audit flags with existing flags
             def parse_flags(flags_data):
@@ -850,35 +1277,64 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                     green_flags.append(flag_obj)
                 elif audit_flag.type == "blue":
                     blue_flags.append(flag_obj)
+
+            # Step 9: Deterministic score computation from all merged flags
+            adjusted_score = 100.0
+            for f in red_flags:
+                if f.deduction is not None:
+                    adjusted_score -= abs(float(f.deduction))
+            for f in green_flags:
+                if f.bonus is not None:
+                    adjusted_score += abs(float(f.bonus))
+            # Also apply audit penalty for items without explicit deduction
+            adjusted_score += total_audit_penalty
+            adjusted_score = max(0.0, min(100.0, adjusted_score))
+
+            # Translate flags to requested language (no scoring changes)
+            red_flags = self._translate_flags(red_flags, language)
+            green_flags = self._translate_flags(green_flags, language)
+            blue_flags = self._translate_flags(blue_flags, language)
             
-            # Parse narrative - accept either smartbuyer_score_summary or legacy trust_score_summary
-            narrative_obj = parsed.get("narrative", {})
-            if isinstance(narrative_obj, str):
-                try:
-                    narrative_obj = json.loads(narrative_obj)
-                except Exception:
-                    narrative_obj = {}
+            # ── AI Narrative Generation ──
+            # Pass full parsed data + final flags to AI for rich, personalized narrative
+            print(f"Generating AI narrative for score {adjusted_score}...")
+            ai_result = self._call_narrative_api(parsed, adjusted_score, red_flags, green_flags, blue_flags, language)
+            narrative_obj = ai_result.get("narrative", {}) if isinstance(ai_result, dict) else {}
+            if not isinstance(narrative_obj, dict):
+                narrative_obj = {}
+            buyer_msg = ai_result.get("buyer_message") if isinstance(ai_result, dict) else None
+
             # Normalize legacy key
             if "trust_score_summary" in narrative_obj and "smartbuyer_score_summary" not in narrative_obj:
                 narrative_obj["smartbuyer_score_summary"] = narrative_obj.pop("trust_score_summary")
-            # Provide safe defaults for missing narrative fields
+
+            # Fallback defaults for any fields the AI left empty
             defaults = {
-                "vehicle_overview": "Contract analysis",
-                "smartbuyer_score_summary": f"Score: {adjusted_score}",
-                "market_comparison": "Market analysis pending",
-                "gap_logic": "GAP analysis pending",
-                "vsc_logic": "VSC analysis pending",
-                "apr_bonus_rule": "APR analysis pending",
+                "vehicle_overview": f"Deal analysis for {parsed.get('dealer_name', 'this dealer')}.",
+                "smartbuyer_score_summary": f"SmartBuyer Score: {adjusted_score}/100.",
+                "score_breakdown": f"Final Score: {adjusted_score}",
+                "market_comparison": "Market comparison pending.",
+                "gap_logic": "GAP analysis pending.",
+                "vsc_logic": "VSC analysis pending.",
+                "apr_bonus_rule": "APR analysis pending.",
                 "lease_audit": "N/A - Purchase Agreement",
-                "trade": trade_data.status,  # Use extracted trade status
-                "negotiation_insight": "Negotiation guidance pending",
-                "final_recommendation": "Review all terms carefully before signing."
+                "trade": trade_data.status if trade_data else "No trade-in on this deal.",
+                "negotiation_insight": "Review all flags before signing.",
+                "final_recommendation": "Proceed with caution based on the flags above."
             }
             for k, v in defaults.items():
-                narrative_obj.setdefault(k, v)
+                if not narrative_obj.get(k):
+                    narrative_obj[k] = v
+
+            if not buyer_msg:
+                buyer_msg = f"Your SmartBuyer score is {adjusted_score}/100 — review the flags above."
+
+            # Ensure trade is a string
+            if "trade" in narrative_obj and not isinstance(narrative_obj["trade"], str):
+                narrative_obj["trade"] = str(narrative_obj["trade"])
 
             narrative = Narrative(**narrative_obj)
-            
+
             return MultiImageAnalysisResponse(
                 score=adjusted_score,
                 buyer_name=parsed.get("buyer_name"),
@@ -893,7 +1349,7 @@ Return ONLY valid JSON matching the exact schema. No markdown, no explanation.
                 selling_price=parsed.get("selling_price"),
                 vin_number=parsed.get("vin_number"),
                 date=parsed.get("date"),
-                buyer_message=parsed.get("buyer_message", "Contract analysis completed"),
+                buyer_message=buyer_msg,
                 red_flags=red_flags,
                 green_flags=green_flags,
                 blue_flags=blue_flags,

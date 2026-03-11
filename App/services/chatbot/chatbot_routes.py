@@ -130,7 +130,8 @@ async def concierge(
         base_prompt = (
             "You are a negotiation expert. The user is asking for an explanation of a negotiation term or concept. "
             "Provide a child-like, clear, concise definition and a practical example of how it's used in negotiations. "
-            "Keep your response focused and educational."
+            "Keep your response focused and educational. "
+            f"Respond entirely in {req.language}."
         )
         messages = [{"role": "system", "content": base_prompt}]
         messages.append({"role": "user", "content": req.message})
@@ -150,7 +151,8 @@ async def concierge(
             "Be resistant but slightly reasonable. Push back on prices and terms but be open to compromise. "
             f"{scenario_context} "
             "Your responses should indirectly teach negotiation techniques through the conversation. "
-            "Keep responses concise (1-2 sentences typically)."
+            "Keep responses concise (1-2 sentences typically). "
+            f"Respond entirely in {req.language}."
         )
         
         # Add specific guidance if dealer tactic is detected

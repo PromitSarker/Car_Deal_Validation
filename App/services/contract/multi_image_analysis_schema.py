@@ -36,6 +36,7 @@ class TradeData(BaseModel):
 class Narrative(BaseModel):
     vehicle_overview: str
     smartbuyer_score_summary: str
+    score_breakdown: Optional[str] = None
     market_comparison: str
     gap_logic: str
     vsc_logic: str
@@ -45,9 +46,9 @@ class Narrative(BaseModel):
     negotiation_insight: str
     final_recommendation: str
 
-class MultiImageAnalysisRequest(BaseModel):
-    images: List[str] = Field(..., description="List of base64 encoded contract images or URLs")
-    analysis_type: str = Field(default="contract_quality", description="Type of contract analysis")
+class ContractJsonRequest(BaseModel):
+    data: dict = Field(..., description="Pre-extracted JSON data for contract analysis")
+    language: str = Field(default="English", description="Language for narrative parts")
 
 class MultiImageAnalysisResponse(BaseModel):
     score: float = Field(..., description="Overall score 0-95")

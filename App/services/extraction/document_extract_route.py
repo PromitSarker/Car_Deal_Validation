@@ -6,7 +6,9 @@ import json
 router = APIRouter(prefix="/document-extract", tags=["Document Extraction"])
 
 @router.post("/extract-logo")
-async def extract_logo_from_document(files: UploadFile = File(...)):
+async def extract_logo_from_document(
+    files: UploadFile = File(..., description="Upload an image or document file to extract logo text")
+):
     """
     Extract text from logos in an uploaded document using OpenAI's Vision API.
     Accepts image or document files and returns extracted logo text.

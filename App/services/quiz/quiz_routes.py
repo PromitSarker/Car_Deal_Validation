@@ -1,20 +1,11 @@
 import httpx
-from fastapi import APIRouter, HTTPException, Query
-from App.services.quiz.quiz_schemas import QuizQuestion
+from fastapi import APIRouter, HTTPException
+from App.services.quiz.quiz_schemas import QuizQuestion, QuizRequest
 from App.core.config import settings
 from typing import List
-import json 
-from enum import Enum
-from App.services.quiz.quiz_schemas import QuizQuestion, QuizRequest
+import json
 
 router = APIRouter(prefix="/quiz", tags=["quiz"])
-
-class SupportedLanguage(str, Enum):
-    english = "English"
-    spanish = "Spanish"
-    arabic  = "Arabic"
-    mandarin = "Mandarin"
-    hindi = "Hindi"
      
 
 QUIZ_GENERATION_PROMPT = """
@@ -141,3 +132,4 @@ async def generate_quiz_questions(
 
     # Ensure exactly count
     return [QuizQuestion(**q) for q in collected[:count]]
+

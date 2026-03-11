@@ -6,7 +6,9 @@ router = APIRouter(prefix="/api", tags=["extraction"])
 extractor = OCRExtractor()
 
 @router.post("/extract_quote_vision", operation_id="extract_quote_data_vision")
-async def extract_quote_vision(files: List[UploadFile] = File(...)):
+async def extract_quote_vision(
+    files: List[UploadFile] = File(..., description="Upload quote/contract images (jpg, png, pdf)")
+):
     """
     Extract quote/contract data using ChatGPT Vision OCR.
     

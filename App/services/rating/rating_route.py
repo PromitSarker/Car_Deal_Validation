@@ -1,22 +1,48 @@
-from fastapi import APIRouter, HTTPException, File, UploadFile
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form
 from typing import List
-from .rating_schema import MultiImageAnalysisResponse
+from .rating_schema import MultiImageAnalysisResponse, RatingJsonRequest
 from .rating import MultiImageAnalyzer
 
 router = APIRouter(prefix="/api", tags=["Rating"])
 analyzer = MultiImageAnalyzer()
 
+
 @router.post("/rating", response_model=MultiImageAnalysisResponse)
-async def analyze_multiple_images(files: List[UploadFile] = File(...)):
+async def analyze_rating_upload(
+    files: List[UploadFile] = File(
+        ...,
+        description="Upload image files (jpg, png, gif, bmp, webp, pdf, tiff)"
+    ),
+    language: str = Form(default="English", description="Language for narrative parts")
+):
     """
-    Analyze multiple contract image files and provide a comprehensive rating.
-    
-    - **files**: Multiple image files (jpg, png, gif, bmp, webp, pdf, tiff)
-    - Accepts up to 10MB per file
+    Analyze multiple contract image files (file upload) and provide a comprehensive rating.
+
+    - **files**: Multiple image files (jpg, png, gif, bmp, webp, pdf, tiff) — up to 10MB per file
+    - **language**: Language for narrative parts (default: English)
     """
     try:
-        result = await analyzer.analyze_images(files)
+        result = await analyzer.analyze_images(files, language=language)
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+@router.post("/rating/json", response_model=MultiImageAnalysisResponse)
+async def analyze_rating_json(request: RatingJsonRequest):
+    """
+    Analyze contract via JSON body.
+
+    - **data**: Pre-extracted JSON data dict for rating analysis
+    - **language**: Language for narrative parts (default: English)
+    """
+    try:
+        result = await analyzer.analyze_images(language=request.language, parsed_data=request.data)
+        return result
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
