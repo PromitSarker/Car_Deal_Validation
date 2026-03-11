@@ -300,10 +300,27 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
     # ─── Metadata ───
     parsed["quote_type"] = _pick_first(flat, "quote_type", "document_type") or "Audit"
 
-    # ─── Flags (initially empty — scoring pipeline will generate them) ───
-    parsed["red_flags"] = []
-    parsed["green_flags"] = []
-    parsed["blue_flags"] = []
+    # ─── Flags ───
+    # If the input already contains pre-computed flags (from a prior OCR/AI analysis),
+    # carry them through so the scoring pipeline uses them directly.
+    # Otherwise start empty — the Python audit pipeline will generate them.
+    def _has_real_flags(raw) -> bool:
+        return isinstance(raw, list) and len(raw) > 0 and any(
+            isinstance(f, dict) and (f.get("type") or f.get("message")) for f in raw
+        )
+
+    in_red   = data.get("red_flags",   [])
+    in_green = data.get("green_flags", [])
+    in_blue  = data.get("blue_flags",  [])
+
+    parsed["red_flags"]   = in_red   if _has_real_flags(in_red)   else []
+    parsed["green_flags"] = in_green if _has_real_flags(in_green) else []
+    parsed["blue_flags"]  = in_blue  if _has_real_flags(in_blue)  else []
+
+    # Signal to the scoring pipeline: pre-existing flags are present, skip Python audit merge
+    parsed["has_precomputed_flags"] = (
+        _has_real_flags(in_red) or _has_real_flags(in_green) or _has_real_flags(in_blue)
+    )
 
     # ─── Score placeholder (scoring pipeline recalculates) ───
     parsed["score"] = 75.0

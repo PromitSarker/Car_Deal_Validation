@@ -1260,23 +1260,28 @@ Return ONLY a JSON object with exactly these keys:
             red_flags = parse_flags(parsed.get("red_flags", []))
             green_flags = parse_flags(parsed.get("green_flags", []))
             blue_flags = parse_flags(parsed.get("blue_flags", []))
-            
-            # Merge audit flags
-            for audit_flag in audit_flags:
-                flag_obj = Flag(
-                    type=audit_flag.type,
-                    message=audit_flag.message,
-                    item=audit_flag.item,
-                    deduction=audit_flag.deduction,
-                    bonus=audit_flag.bonus
-                )
-                
-                if audit_flag.type == "red":
-                    red_flags.append(flag_obj)
-                elif audit_flag.type == "green":
-                    green_flags.append(flag_obj)
-                elif audit_flag.type == "blue":
-                    blue_flags.append(flag_obj)
+
+            # Only merge Python audit flags when no pre-existing flags were supplied.
+            # If the input already has flags (from a prior OCR/AI analysis), skip the
+            # audit merge — the pre-existing flags ARE the authoritative analysis.
+            has_precomputed = parsed.get("has_precomputed_flags", False)
+            if not has_precomputed:
+                for audit_flag in audit_flags:
+                    flag_obj = Flag(
+                        type=audit_flag.type,
+                        message=audit_flag.message,
+                        item=audit_flag.item,
+                        deduction=audit_flag.deduction,
+                        bonus=audit_flag.bonus
+                    )
+                    if audit_flag.type == "red":
+                        red_flags.append(flag_obj)
+                    elif audit_flag.type == "green":
+                        green_flags.append(flag_obj)
+                    elif audit_flag.type == "blue":
+                        blue_flags.append(flag_obj)
+
+            print(f"Python flags - Red: {len(red_flags)}, Green: {len(green_flags)}, Blue: {len(blue_flags)}")
 
             # Step 9: Deterministic score computation from all merged flags
             adjusted_score = 100.0
@@ -1286,8 +1291,9 @@ Return ONLY a JSON object with exactly these keys:
             for f in green_flags:
                 if f.bonus is not None:
                     adjusted_score += abs(float(f.bonus))
-            # Also apply audit penalty for items without explicit deduction
-            adjusted_score += total_audit_penalty
+            # Apply audit penalty only when using Python-generated flags
+            if not has_precomputed:
+                adjusted_score += total_audit_penalty
             adjusted_score = max(0.0, min(100.0, adjusted_score))
 
             # Translate flags to requested language (no scoring changes)

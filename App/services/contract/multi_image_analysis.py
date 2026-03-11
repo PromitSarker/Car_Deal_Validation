@@ -2239,21 +2239,25 @@ Return ONLY a JSON object with exactly these keys:
             green_flags = parse_flags(parsed.get("green_flags", []))
             blue_flags = parse_flags(parsed.get("blue_flags", []))
 
-            # Merge audit-generated flags into the flag arrays
-            for af in audit_flags:
-                flag_obj = Flag(
-                    type=af.type,
-                    message=af.message,
-                    item=af.item,
-                    deduction=af.deduction,
-                    bonus=af.bonus
-                )
-                if af.type == "red":
-                    red_flags.append(flag_obj)
-                elif af.type == "green":
-                    green_flags.append(flag_obj)
-                elif af.type == "blue":
-                    blue_flags.append(flag_obj)
+            # Only merge Python audit flags when no pre-existing flags were supplied.
+            # If the input already has flags (from a prior OCR/AI analysis), skip the
+            # audit merge — the pre-existing flags ARE the authoritative analysis.
+            has_precomputed = parsed.get("has_precomputed_flags", False)
+            if not has_precomputed:
+                for af in audit_flags:
+                    flag_obj = Flag(
+                        type=af.type,
+                        message=af.message,
+                        item=af.item,
+                        deduction=af.deduction,
+                        bonus=af.bonus
+                    )
+                    if af.type == "red":
+                        red_flags.append(flag_obj)
+                    elif af.type == "green":
+                        green_flags.append(flag_obj)
+                    elif af.type == "blue":
+                        blue_flags.append(flag_obj)
 
             # Deterministic score from all merged flags (red/green only)
             score = 100.0
