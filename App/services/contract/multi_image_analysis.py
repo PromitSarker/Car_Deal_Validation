@@ -738,8 +738,10 @@ else:  # vsc_price > vsc_cap
 - **No add-on coverage breakdown**: Product listed but details missing (0)
 - **Term >72 months**: Loan >6 years increases interest (0)
 - **Term vs coverage mismatch**: Finance term exceeds coverage (0)
+- **General Advisory (ALWAYS REQUIRED)**: If none of the above specific criteria apply, you MUST still include exactly one blue flag: `{"type": "General Advisory", "message": "Review all final contract terms, product details, and payment figures carefully before signing to confirm accuracy.", "item": "General"}` (0 points)
 
 **CRITICAL**: Blue flags have ZERO point impact. Do not use blue flags for items that should be green (e.g., GAP within cap, VSC within cap, doc fees in acceptable range).
+**MANDATORY**: `blue_flags` array MUST NEVER be empty — always include at least the General Advisory if no other criteria apply.
 
 ### 🔴 RED FLAGS
 ❌ High-risk, overpriced, or non-compliant terms
@@ -1756,7 +1758,56 @@ Return ONLY a JSON object with exactly these keys:
             return "Bronze"
         else:
             return "Red"
-            
+
+    def _call_json_analysis_api(self, parsed_converted: dict, language: str = "English") -> dict:
+        """Call OpenAI with the full system prompt + pre-extracted JSON data.
+        Returns the raw OpenAI response dict (same format as _call_openai_api).
+        AI computes score, flags, and narrative following the prompt rules.
+        """
+        skip_keys = {"has_precomputed_flags", "_ai_score", "_ai_narrative_done",
+                     "red_flags", "green_flags", "blue_flags", "narrative",
+                     "score", "bundle_abuse", "raw_text", "ocr_text"}
+        clean_data = {k: v for k, v in parsed_converted.items() if k not in skip_keys}
+
+        user_text = f"""{'=' * 80}
+LANGUAGE REQUIREMENT: ALL narrative text fields MUST be in {language}
+{'=' * 80}
+
+{self.system_prompt}
+
+Below is the pre-extracted structured data from a customer's auto contract document.
+Apply ALL scoring rules, flag rules, and narrative requirements from the system prompt above.
+Compute the FINAL SCORE following the EXACT prompt rules (start at 100, apply all penalties/bonuses/ceilings).
+Do NOT use any score value present in the data — recompute it from scratch using the rules above.
+
+PRE-EXTRACTED DEAL DATA:
+{json.dumps(clean_data, indent=2)}
+
+Return ONLY valid JSON matching the exact output schema defined in the system prompt. No markdown, no explanation."""
+
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": user_text}],
+            "temperature": 0.0,
+            "max_tokens": 4000,
+            "seed": 42,
+            "response_format": {"type": "json_object"}
+        }
+        last_error = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                print(f"JSON full-analysis API call attempt {attempt + 1}/{self.MAX_RETRIES}...")
+                resp = requests.post(self.api_url, headers=headers, json=payload, timeout=self.API_TIMEOUT)
+                resp.raise_for_status()
+                print("JSON full-analysis API call successful.")
+                return resp.json()
+            except Exception as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES - 1:
+                    import time; time.sleep(2)
+        raise RuntimeError(f"JSON analysis API failed after {self.MAX_RETRIES} attempts: {last_error}")
+
     def _normalize_line_items(self, line_items: List[Dict]) -> List[NormalizedLineItem]:
         """Normalize OCR line items using the OCR normalizer before scoring."""
         normalized = []
@@ -1987,6 +2038,23 @@ Return ONLY a JSON object with exactly these keys:
                 # Always run through converter for consistent structure
                 # Handles both nested (buyer_info, vehicle_details...) and flat formats
                 parsed = convert_extracted_json_to_parsed(parsed_data)
+
+                # Route: no pre-existing flags → call AI for full analysis following the prompts
+                if not parsed.get("has_precomputed_flags", False):
+                    print("JSON path: no pre-existing flags — calling AI for full prompt-based analysis...")
+                    api_response = self._call_json_analysis_api(parsed, language)
+                    ai_result = self._parse_api_response(api_response)
+                    # Preserve key identity fields from converter
+                    for k in ("buyer_name", "dealer_name", "logo_text", "email",
+                              "phone_number", "address", "state", "region", "vin_number", "date"):
+                        if not ai_result.get(k) and parsed.get(k):
+                            ai_result[k] = parsed[k]
+                    if not ai_result.get("trade") and parsed.get("trade"):
+                        ai_result["trade"] = parsed["trade"]
+                    ai_result["_ai_score"] = float(ai_result.get("score") or 75.0)
+                    ai_result["has_precomputed_flags"] = True
+                    ai_result["_ai_narrative_done"] = True
+                    parsed = ai_result
             elif base64_images is None:
                 validated_files = await self._validate_files(files)
                 if not validated_files:
@@ -2259,15 +2327,19 @@ Return ONLY a JSON object with exactly these keys:
                     elif af.type == "blue":
                         blue_flags.append(flag_obj)
 
-            # Deterministic score from all merged flags (red/green only)
-            score = 100.0
-            for f in red_flags:
-                if f.deduction is not None:
-                    score -= abs(float(f.deduction))
-            for f in green_flags:
-                if f.bonus is not None:
-                    score += abs(float(f.bonus))
-            score = max(0.0, min(100.0, score))
+            # Score — use AI's prompt-based score when available, otherwise compute from flags
+            if parsed.get("_ai_score") is not None:
+                score = max(0.0, min(100.0, float(parsed["_ai_score"])))
+                print(f"Using AI prompt-based score: {score}")
+            else:
+                score = 100.0
+                for f in red_flags:
+                    if f.deduction is not None:
+                        score -= abs(float(f.deduction))
+                for f in green_flags:
+                    if f.bonus is not None:
+                        score += abs(float(f.bonus))
+                score = max(0.0, min(100.0, score))
 
             # Validate score_breakdown vs computed score (log only)
             score_breakdown = parsed.get("narrative", {}).get("score_breakdown", "")
@@ -2287,7 +2359,15 @@ Return ONLY a JSON object with exactly these keys:
             red_flags = self._translate_flags(red_flags, language)
             green_flags = self._translate_flags(green_flags, language)
             blue_flags = self._translate_flags(blue_flags, language)
-            
+
+            # Safety net: ensure every flag category has at least one item
+            if not red_flags:
+                red_flags.append(Flag(type="red", message="No major compliance issues identified — review all terms before signing.", item="General"))
+            if not green_flags:
+                green_flags.append(Flag(type="green", message="No standout positive elements identified for this deal.", item="General"))
+            if not blue_flags:
+                blue_flags.append(Flag(type="blue", message="Review all final contract terms, product details, and payment figures carefully before signing to confirm accuracy.", item="General Advisory"))
+
             # REMOVE DUPLICATE FLAG LOGIC - This causes inconsistency!
             # The VSC fair pricing logic below modifies flags AFTER API response
             # This can cause different results on each run
@@ -2319,14 +2399,21 @@ Return ONLY a JSON object with exactly these keys:
             # if not red_flags:
             #     red_flags.append(...)
             
-            # ── AI Narrative Generation ──
-            # Pass full parsed data + final flags to AI for rich, personalized narrative
-            print(f"Generating AI narrative for score {score}...")
-            ai_result = self._call_narrative_api(parsed, score, red_flags, green_flags, blue_flags, language)
-            narrative_data = ai_result.get("narrative", {}) if isinstance(ai_result, dict) else {}
-            if not isinstance(narrative_data, dict):
-                narrative_data = {}
-            buyer_msg = ai_result.get("buyer_message") if isinstance(ai_result, dict) else None
+            # ── AI Narrative ──
+            if not parsed.get("_ai_narrative_done"):
+                # Pre-existing flags path: call AI separately for narrative
+                print(f"Generating AI narrative for score {score}...")
+                ai_result = self._call_narrative_api(parsed, score, red_flags, green_flags, blue_flags, language)
+                narrative_data = ai_result.get("narrative", {}) if isinstance(ai_result, dict) else {}
+                if not isinstance(narrative_data, dict):
+                    narrative_data = {}
+                buyer_msg = ai_result.get("buyer_message") if isinstance(ai_result, dict) else None
+            else:
+                # Full AI analysis already included narrative — extract directly
+                narrative_data = parsed.get("narrative", {})
+                if not isinstance(narrative_data, dict):
+                    narrative_data = {}
+                buyer_msg = parsed.get("buyer_message")
 
             # Normalize legacy key
             if "trust_score_summary" in narrative_data and "smartbuyer_score_summary" not in narrative_data:
@@ -2356,6 +2443,18 @@ Return ONLY a JSON object with exactly these keys:
             # Ensure trade is always a string
             if "trade" in narrative_data and not isinstance(narrative_data["trade"], str):
                 narrative_data["trade"] = str(narrative_data["trade"])
+
+            # Ensure score_breakdown is always a string (AI sometimes returns a list of flag dicts)
+            if "score_breakdown" in narrative_data and not isinstance(narrative_data["score_breakdown"], str):
+                sb = narrative_data["score_breakdown"]
+                if isinstance(sb, list):
+                    narrative_data["score_breakdown"] = "; ".join(
+                        f"{f.get('type','?')}: {f.get('message','?')} ({f.get('deduction', f.get('bonus','?'))}pt)"
+                        if isinstance(f, dict) else str(f)
+                        for f in sb
+                    )
+                else:
+                    narrative_data["score_breakdown"] = str(sb)
 
             if trade_data and narrative_data.get("trade"):
                 trade_data.status = narrative_data["trade"]
