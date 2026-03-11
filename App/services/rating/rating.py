@@ -724,39 +724,38 @@ Return ONLY a JSON object with exactly these keys:
         else:
             return "Red"
 
-    def _call_json_analysis_api(self, parsed_converted: dict, language: str = "English") -> dict:
-        """Call OpenAI with the full system prompt + pre-extracted JSON data.
-        Returns the raw OpenAI response dict (same format as _call_openai_api).
-        AI computes score, flags, and narrative following the prompt rules.
+    def _call_json_analysis_api(self, raw_data: dict, language: str = "English") -> dict:
+        """Call OpenAI with the full system prompt + original raw deal data.
+        Uses proper system/user message split identical to _call_openai_api.
+        Returns the raw OpenAI response dict.
         """
-        # Strip internal-only converter keys before sending
-        skip_keys = {"has_precomputed_flags", "_ai_score", "_ai_narrative_done",
-                     "red_flags", "green_flags", "blue_flags", "narrative",
-                     "score", "bundle_abuse", "raw_text", "ocr_text"}
-        clean_data = {k: v for k, v in parsed_converted.items() if k not in skip_keys}
+        # Strip only internal pipeline keys; keep all original deal fields intact
+        skip_keys = {"has_precomputed_flags", "has_vision_extraction", "_ai_score", "_ai_narrative_done"}
+        clean_data = {k: v for k, v in raw_data.items() if k not in skip_keys}
 
         user_text = f"""{'=' * 80}
-LANGUAGE REQUIREMENT: ALL narrative text fields MUST be in {language}
+LANGUAGE REQUIREMENT: ALL narrative text fields MUST be in {language}. Translate all flag messages and narrative fields to {language}.
 {'=' * 80}
 
-{self.system_prompt}
-
 Below is the pre-extracted structured data from a customer's auto deal document.
-Apply ALL scoring rules, flag rules, and narrative requirements from the system prompt above.
-Compute the FINAL SCORE following the EXACT prompt rules (start at 100, apply all penalties/bonuses/ceilings/structural adjustments).
-Do NOT use any score value present in the data — recompute it from scratch using the rules above.
+Apply ALL scoring rules, flag rules, and narrative requirements from the system prompt.
+Compute the FINAL SCORE following the EXACT rules (start at 100, apply all penalties/bonuses/ceilings/structural adjustments).
+Do NOT use any score value present in the input data — recompute from scratch.
 
 PRE-EXTRACTED DEAL DATA:
 {json.dumps(clean_data, indent=2)}
 
-Return ONLY valid JSON matching the exact output schema defined in the system prompt. No markdown, no explanation."""
+Return ONLY valid JSON matching the exact output schema. No markdown, no explanation."""
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": user_text}],
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_text}
+            ],
             "temperature": 0.0,
-            "max_tokens": 4000,
+            "max_tokens": 4096,
             "seed": 42,
             "response_format": {"type": "json_object"}
         }
@@ -1016,11 +1015,15 @@ Return ONLY valid JSON matching the exact output schema defined in the system pr
                 # Handles both nested (buyer_info, vehicle_details...) and flat formats
                 parsed = convert_extracted_json_to_parsed(parsed_data)
 
-                # Route: no pre-existing flags → call AI for full analysis following the prompts
-                # The prompts are the holy bible for scoring — let AI apply them to the JSON data
-                if not parsed.get("has_precomputed_flags", False):
-                    print("JSON path: no pre-existing flags — calling AI for full prompt-based analysis...")
-                    api_response = self._call_json_analysis_api(parsed, language)
+                # Route to AI ONLY when no pre-existing flags are supplied.
+                # If the caller already provided red/green/blue flags, their deductions/bonuses
+                # ARE the authoritative score — use Python math, never AI re-scoring.
+                should_use_ai = not parsed.get("has_precomputed_flags", False)
+                if should_use_ai:
+                    print("JSON path: calling AI for full prompt-based analysis...")
+                    # Pass the ORIGINAL raw data so AI sees real values (apr, msrp, fees etc.)
+                    # not the abstracted converter output
+                    api_response = self._call_json_analysis_api(parsed_data, language)
                     ai_result = self._parse_api_response(api_response)
                     # AI result is now the primary parsed — preserve key identity fields from converter
                     for k in ("buyer_name", "dealer_name", "logo_text", "email",
@@ -1030,8 +1033,9 @@ Return ONLY valid JSON matching the exact output schema defined in the system pr
                     # Preserve trade dict from converter if AI didn't extract it
                     if not ai_result.get("trade") and parsed.get("trade"):
                         ai_result["trade"] = parsed["trade"]
-                    # Store AI's computed score (prompt-based, includes ceilings/adjustments)
-                    ai_result["_ai_score"] = float(ai_result.get("score") or 75.0)
+                    # Do NOT use AI's score field — AI flags contain correct deductions/bonuses,
+                    # Python will compute the final score from those flags below.
+                    ai_result.pop("score", None)
                     # Mark: audit merge and narrative call should be skipped
                     ai_result["has_precomputed_flags"] = True
                     ai_result["_ai_narrative_done"] = True
@@ -1355,13 +1359,12 @@ Return ONLY valid JSON matching the exact output schema defined in the system pr
 
             print(f"Python flags - Red: {len(red_flags)}, Green: {len(green_flags)}, Blue: {len(blue_flags)}")
 
-            # Step 9: Score
-            # If AI did full prompt-based analysis, its score incorporates all prompt rules
-            # (ceilings, structural adjustments, etc.) — use it directly.
-            # Otherwise compute from flags using Python math.
+            # Score — always compute from flags (AI returns correct deductions/bonuses in flags,
+            # but its 'score' field is unreliable and ignored)
             if parsed.get("_ai_score") is not None:
+                # Legacy pre-existing flags path (score was explicitly set)
                 adjusted_score = max(0.0, min(100.0, float(parsed["_ai_score"])))
-                print(f"Using AI prompt-based score: {adjusted_score}")
+                print(f"Using pre-set score: {adjusted_score}")
             else:
                 adjusted_score = 100.0
                 for f in red_flags:

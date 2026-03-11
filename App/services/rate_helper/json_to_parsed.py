@@ -92,13 +92,58 @@ def _flatten_nested(data: dict) -> dict:
     return flat
 
 
+# Keys that are expected at the top level of a valid input payload.
+# If NONE of these appear, the dict is likely a single-key wrapper (e.g.
+# {"additionalProp1": { ...actual data... }}) and should be unwrapped.
+_KNOWN_TOP_LEVEL_KEYS = {
+    "buyer_name", "dealer_name", "buyer_info", "dealer_info",
+    "vehicle_details", "vehicle", "financial_terms", "financials",
+    "visionApiExtraction", "vision_api_extraction", "ocr_extraction",
+    "red_flags", "green_flags", "blue_flags", "narrative",
+    "score", "selling_price", "apr", "term", "trade",
+    "vin_number", "vin", "email", "phone_number", "address",
+    "state", "region", "badge", "quote_type", "normalized_pricing",
+    "bundle_abuse", "addons_and_packages", "lease_specific",
+    "extracted_text", "quality_assessment", "discount_incentive",
+    "logo_text", "date", "buyer_message", "name",
+}
+
+
+def _unwrap_if_needed(data: dict) -> dict:
+    """Detect and unwrap arbitrary single-key wrapper dicts.
+
+    Handles inputs like {"additionalProp1": { ...real data... }} that are
+    sent when the caller wraps the payload under a dynamic property name.
+    If none of the known top-level keys are present but there are sub-dicts,
+    merge all sub-dict values into a single flat dict.
+    """
+    if not data:
+        return data
+    # If any recognised key is present we're already at the right level
+    if any(k in _KNOWN_TOP_LEVEL_KEYS for k in data):
+        return data
+    # No known keys — collect all values that are dicts (the wrapped payloads)
+    dict_values = [v for v in data.values() if isinstance(v, dict)]
+    if not dict_values:
+        return data
+    # Merge all wrapped dicts (most common case: exactly one wrapper key)
+    merged: dict = {}
+    for v in dict_values:
+        merged.update(v)
+    return merged
+
+
 def convert_extracted_json_to_parsed(data: dict) -> dict:
     """
     Convert user-provided JSON data into the 'parsed' dict format
     that the rating/contract/lease scoring pipelines consume.
 
     Handles both nested and flat structures with multiple naming conventions.
+    Also handles single-key wrapper payloads like {"additionalProp1": {...}}.
     """
+    # Step 0: Unwrap arbitrary top-level wrappers (e.g. additionalProp1)
+    data = _unwrap_if_needed(data)
+
     # Step 1: Flatten all nested sections for uniform access
     flat = _flatten_nested(data)
 
@@ -320,6 +365,12 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
     # Signal to the scoring pipeline: pre-existing flags are present, skip Python audit merge
     parsed["has_precomputed_flags"] = (
         _has_real_flags(in_red) or _has_real_flags(in_green) or _has_real_flags(in_blue)
+    )
+
+    # Signal: raw OCR extraction wrapper was present — AI should always re-analyze regardless of flags
+    parsed["has_vision_extraction"] = bool(
+        data.get("visionApiExtraction") or data.get("vision_api_extraction")
+        or data.get("ocr_extraction") or data.get("extraction_result")
     )
 
     # ─── Score placeholder (scoring pipeline recalculates) ───
