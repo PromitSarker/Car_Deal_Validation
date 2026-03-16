@@ -354,7 +354,7 @@ UI messaging: "Rolled negative equity increases the amount financed and overall 
 
 **CRITICAL NEGATIVE EQUITY FLAG RULES:**
 - The negative equity itself (trade payoff > allowance) → MUST be a **BLUE** advisory flag with `deduction: 0` and `bonus: null`. It is NEVER a red flag.
-- The structural score adjustment → MUST be encoded as a **RED** flag with `item: "Structure Risk"` and the computed `deduction` value (5 or 10). Use the message: "Structure Risk Adjustment: Rolled negative equity of $[amount] increases total loan exposure — this is a structure risk adjustment, not a dealer behavior penalty."
+- The structural score adjustment → MUST be encoded as a **RED** flag with `item: "Structure Risk"` and the computed `deduction` value (5 or 10). Use the message: "Structure Risk Adjustment: Rolled negative equity of -$[amount] increases total loan exposure — this is a structure risk adjustment, not a dealer behavior penalty."
 - Do NOT output the structural adjustment as a deduction:0 flag — it MUST have the real deduction value.
 - NEVER create a green flag for "positive trade equity" when trade payoff > trade allowance.
 
@@ -374,7 +374,7 @@ All narratives must use "SmartBuyer Score" not "Trust Score" in Quote Mode.
 
 **SmartBuyer Score Summary:**
 - Explain score, penalties and bonuses clearly
-- If negative equity adjustment applied: "The [X]-point adjustment for negative equity reflects increased loan exposure from rolling $[amount] into the new loan. This is a structure risk, not a dealer behavior penalty."
+- If negative equity adjustment applied: "The [X]-point adjustment for negative equity reflects increased loan exposure from rolling -$[amount] into the new loan. This is a structure risk, not a dealer behavior penalty."
 
 **GAP Logic (REQUIRED TEXT WHEN GAP IS ABSENT):**
 "GAP coverage is optional but commonly recommended for financed purchases, especially when negative equity or longer loan terms are present. While not required, GAP can protect against financial loss if the vehicle is totaled before the loan is paid off, particularly when negative equity exists."
@@ -388,7 +388,7 @@ All narratives must use "SmartBuyer Score" not "Trust Score" in Quote Mode.
 **Trade (REQUIRED - ALWAYS INCLUDE):**
 If trade information is present:
 - State: "Trade identified: $[allowance] allowance, $[payoff] payoff"
-- If payoff > allowance: "Negative equity of $[amount] rolled into new loan"
+- If payoff > allowance: "Negative equity of -$[amount] rolled into new loan"
 - If allowance > payoff: "Positive equity of $[amount] applied to purchase"
 - If allowance = payoff: "Trade equity neutral"
 - Use exact math: negative equity = payoff - allowance (only when payoff > allowance)
@@ -1006,7 +1006,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             
             if trade_equity < 0:
                 negative_equity_amount = abs(trade_equity)
-                trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Negative equity of ${negative_equity_amount:,.2f} rolled into new loan"
+                trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Negative equity of -${negative_equity_amount:,.2f} rolled into new loan"
             elif trade_equity > 0:
                 equity = trade_equity
                 trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Positive equity of ${equity:,.2f} applied to purchase"
@@ -1020,12 +1020,12 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             trade_status = f"Trade identified: ${trade_payoff:,.2f} payoff (allowance not found)"
 
         elif negative_equity_amount is not None:
-            trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+            trade_status = f"Negative equity identified: -${negative_equity_amount:,.2f} rolled into new loan"
 
         elif equity is not None:
             if equity < 0:
                 negative_equity_amount = abs(equity)
-                trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+                trade_status = f"Negative equity identified: -${negative_equity_amount:,.2f} rolled into new loan"
             elif equity > 0:
                 trade_status = f"Positive equity of ${equity:,.2f} applied to purchase"
         
@@ -1358,7 +1358,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                 neg_equity_flag = AuditFlag(
                     type="blue",
                     category="Negative Equity Alert",
-                    message=f"Rolled negative equity of ${trade_data.negative_equity:,.2f} increases total loan exposure and overall risk.",
+                    message=f"Rolled negative equity of -${trade_data.negative_equity:,.2f} increases total loan exposure and overall risk.",
                     item="Trade",
                     deduction=None,
                     bonus=None
@@ -1376,7 +1376,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                     audit_flags.append(AuditFlag(
                         type="red",
                         category="Structure Risk Adjustment",
-                        message=f"Rolled negative equity of ${trade_data.negative_equity:,.2f} increases the amount financed and overall loan risk. This is a structure risk adjustment, not a dealer behavior penalty.",
+                        message=f"Rolled negative equity of -${trade_data.negative_equity:,.2f} increases the amount financed and overall loan risk. This is a structure risk adjustment, not a dealer behavior penalty.",
                         item="Structure Risk",
                         deduction=_ne_deduction,
                         bonus=None

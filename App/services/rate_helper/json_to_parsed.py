@@ -382,7 +382,7 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
             "trade_payoff": trade_payoff,
             "equity": equity,
             "negative_equity": neg_equity,
-            "status": f"Negative equity of ${neg_equity:,.2f} detected" if neg_equity else f"Trade-in value: ${trade_in_value:,.2f}",
+            "status": f"Negative equity of -${neg_equity:,.2f} detected" if neg_equity else f"Trade-in value: ${trade_in_value:,.2f}",
         }
         parsed["trade_allowance"] = trade_in_value
         parsed["trade_payoff"] = trade_payoff

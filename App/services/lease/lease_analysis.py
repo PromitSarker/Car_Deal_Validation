@@ -664,7 +664,7 @@ Return a valid JSON object with **no markdown, no comments, no trailing commas.*
     "trade_payoff": 18000.00,
     "equity": null,
     "negative_equity": 3000.00,
-    "status": "Trade identified: $15,000.00 allowance, $18,000.00 payoff - Negative equity of $3,000.00 rolled into new lease"
+        "status": "Trade identified: $15,000.00 allowance, $18,000.00 payoff - Negative equity of -$3,000.00 rolled into new lease"
   },
   
   "bundle_abuse": {
@@ -1035,10 +1035,10 @@ CRITICAL EXTRACTION REQUIREMENTS:
   - "Trade Allowance" or "Trade Value" (what dealer pays you)
   - "Payoff" or "Lien Payoff" or "Amount Owed" (what you owe on old vehicle)
 - Calculate: Negative Equity = Payoff - Trade Allowance (if payoff > allowance)
-- Example: Trade Allowance $15,000, Payoff $18,000 → Negative Equity = $3,000
+- Example: Trade Allowance $15,000, Payoff $18,000 → Negative Equity = -$3,000 (display format)
 - Store in trade.negative_equity field
 - Also populate trade.trade_allowance and trade.trade_payoff
-- Set trade.status with description like "Negative equity of $3,000 rolled into lease"
+- Set trade.status with description like "Negative equity of -$3,000 rolled into lease"
 
 **LINE ITEMS (REQUIRED):**
 - Extract ALL products and fees as line items
@@ -1609,7 +1609,7 @@ Return ONLY a JSON object:
             
             if trade_equity < 0:
                 negative_equity_amount = abs(trade_equity)
-                trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Negative equity of ${negative_equity_amount:,.2f} rolled into new loan"
+                trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Negative equity of -${negative_equity_amount:,.2f} rolled into new loan"
             elif trade_equity > 0:
                 equity = trade_equity
                 trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Positive equity of ${equity:,.2f} applied to purchase"
@@ -1618,12 +1618,12 @@ Return ONLY a JSON object:
         
         elif negative_equity_from_text is not None:
             negative_equity_amount = negative_equity_from_text
-            trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+            trade_status = f"Negative equity identified: -${negative_equity_amount:,.2f} rolled into new loan"
 
         elif equity is not None:
             if equity < 0:
                 negative_equity_amount = abs(equity)
-                trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+                trade_status = f"Negative equity identified: -${negative_equity_amount:,.2f} rolled into new loan"
             elif equity > 0:
                 trade_status = f"Positive trade equity of ${equity:,.2f} applied to purchase"
         

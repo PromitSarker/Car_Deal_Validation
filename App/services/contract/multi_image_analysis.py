@@ -763,7 +763,7 @@ else:  # vsc_price > vsc_cap
 
 #### For Negative Equity >$10,000:
 - **REQUIRED Title**: "Significant Negative Trade Equity"
-- **REQUIRED Message Format**: "Trade-in negative equity of $[exact_amount] exceeds $10,000 and was rolled into the new loan."
+- **REQUIRED Message Format**: "Trade-in negative equity of -$[exact_amount] exceeds $10,000 and was rolled into the new loan."
 - **Score Impact**: -10 (NOT -5)
 - **DO NOT use generic phrases** like "negative equity present (disclosed)"
 - **DO NOT combine** with GAP flag into one message
@@ -946,8 +946,8 @@ Authoritative trade definitions:
 
 ### If trade present:
 - State: "Trade identified: $[allowance] allowance, $[payoff] payoff"
-- If payoff > allowance AND (payoff - allowance) ≤ $10,000: "Negative equity of $[amount] rolled into new loan" (-5)
-- If payoff > allowance AND (payoff - allowance) > $10,000: "Significant negative equity of $[amount] exceeds $10,000 and was rolled into new loan" (-10)
+- If payoff > allowance AND (payoff - allowance) ≤ $10,000: "Negative equity of -$[amount] rolled into new loan" (-5)
+- If payoff > allowance AND (payoff - allowance) > $10,000: "Significant negative equity of -$[amount] exceeds $10,000 and was rolled into new loan" (-10)
 - If allowance > payoff: "Positive equity of $[amount] applied to purchase" (+5)
 - If allowance = payoff: "Trade equity neutral"
 - If negative equity NOT disclosed: Global -15 disclosure penalty (not separate)
@@ -1045,7 +1045,7 @@ Authoritative trade definitions:
 ```json
 {
   "type": "Significant Negative Trade Equity",
-  "message": "Trade-in negative equity of $13,248.34 exceeds $10,000 and was rolled into the new loan.",
+    "message": "Trade-in negative equity of -$13,248.34 exceeds $10,000 and was rolled into the new loan.",
   "item": "Trade",
   "deduction": 10.0
 }
@@ -2016,7 +2016,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             
             if trade_equity < 0:
                 negative_equity_amount = abs(trade_equity)
-                trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Negative equity of ${negative_equity_amount:,.2f} rolled into new loan"
+                trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Negative equity of -${negative_equity_amount:,.2f} rolled into new loan"
             elif trade_equity > 0:
                 equity = trade_equity
                 trade_status = f"Trade identified: ${trade_allowance:,.2f} allowance, ${trade_payoff:,.2f} payoff - Positive equity of ${equity:,.2f} applied to purchase"
@@ -2030,12 +2030,12 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             trade_status = f"Trade identified: ${trade_payoff:,.2f} payoff (allowance not found)"
 
         elif negative_equity_amount is not None:
-            trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+            trade_status = f"Negative equity identified: -${negative_equity_amount:,.2f} rolled into new loan"
 
         elif equity is not None:
             if equity < 0:
                 negative_equity_amount = abs(equity)
-                trade_status = f"Negative equity identified: ${negative_equity_amount:,.2f} rolled into new loan"
+                trade_status = f"Negative equity identified: -${negative_equity_amount:,.2f} rolled into new loan"
             elif equity > 0:
                 trade_status = f"Positive equity of ${equity:,.2f} applied to purchase"
         
@@ -2307,7 +2307,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             if trade_data and trade_data.negative_equity and trade_data.negative_equity > 0:
                 audit_flags.append(AuditFlag(
                     type="blue", category="Negative Equity Alert",
-                    message=f"Rolled negative equity of ${trade_data.negative_equity:,.2f} increases amount financed.",
+                    message=f"Rolled negative equity of -${trade_data.negative_equity:,.2f} increases amount financed.",
                     item="Trade", deduction=None, bonus=None
                 ))
 
