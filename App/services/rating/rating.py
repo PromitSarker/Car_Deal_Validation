@@ -1602,7 +1602,19 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                 normalized_pricing=NormalizedPricing(**parsed.get("normalized_pricing", {})),
                 apr=APRData(**parsed.get("apr", {})),
                 term=TermData(**parsed.get("term", {})),
-                trade=trade_data,
+                trade=TradeData(
+                    trade_allowance=trade_data.trade_allowance if trade_data else None,
+                    trade_payoff=trade_data.trade_payoff if trade_data else None,
+                    equity=trade_data.equity if trade_data else None,
+                    negative_equity=(-abs(trade_data.negative_equity) if (trade_data and trade_data.negative_equity is not None) else None),
+                    status=(
+                        (trade_data.status or "")
+                        .replace("Negative equity of $", "Negative equity of -$")
+                        .replace("negative equity of $", "negative equity of -$")
+                        .replace("Negative equity identified: $", "Negative equity identified: -$")
+                        .replace("negative equity identified: $", "negative equity identified: -$")
+                    ) if trade_data else "No trade identified"
+                ),
                 bundle_abuse=parsed.get("bundle_abuse", {"active": False, "deduction": 0}),
                 narrative=narrative
             )
