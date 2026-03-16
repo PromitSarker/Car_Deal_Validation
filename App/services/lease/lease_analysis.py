@@ -1517,9 +1517,13 @@ Return ONLY a JSON object:
         
         # Allowance keywords (priority order)
         allowance_keywords = [
-            "trade allowance", "trade-in allowance", "allowance",
+            "trade allowance", "trade-in allowance",
             "trade value", "trade-in value", "trade in value",
             "acv", "actual cash value"
+        ]
+
+        down_payment_markers = [
+            "down payment", "downpayment", "cash down", "total downpayment"
         ]
         
         for keyword in allowance_keywords:
@@ -1531,6 +1535,9 @@ Return ONLY a JSON object:
                 # Find first money value in snippet
                 match = re.search(money_pattern, snippet)
                 if match:
+                    snippet_lower = snippet.lower()
+                    if any(marker in snippet_lower for marker in down_payment_markers):
+                        continue
                     amount_str = match.group(1).replace(',', '')
                     try:
                         trade_allowance = float(amount_str)

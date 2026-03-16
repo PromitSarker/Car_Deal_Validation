@@ -935,6 +935,15 @@ Extract and analyze:
 
 ## TRADE SECTION (REQUIRED - ALWAYS INCLUDE)
 
+Authoritative trade definitions:
+- Trade Allowance = how much the dealership is giving for the trade vehicle.
+- Trade Payoff = amount owed on the trade vehicle (loan/lien payoff).
+- Trade Difference (if shown) = equity/negative-equity indicator; use document label/sign context.
+- NEVER treat "Cash Down" / "Down Payment" values as Trade Allowance, Trade Payoff, or Trade Difference.
+- Use exact math:
+    - equity = allowance - payoff (when allowance > payoff)
+    - negative_equity = payoff - allowance (when payoff > allowance)
+
 ### If trade present:
 - State: "Trade identified: $[allowance] allowance, $[payoff] payoff"
 - If payoff > allowance AND (payoff - allowance) ≤ $10,000: "Negative equity of $[amount] rolled into new loan" (-5)
@@ -1870,7 +1879,10 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             narrative_lower = narrative_trade.lower()
             money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
 
-            if trade_allowance is None and "allowance" in narrative_lower:
+            if trade_allowance is None and (
+                "trade allowance" in narrative_lower
+                or ("allowance" in narrative_lower and "trade" in narrative_lower)
+            ):
                 match = re.search(money_pattern, narrative_trade)
                 if match:
                     trade_allowance = _coerce_float(match.group(1))
@@ -1916,7 +1928,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
         
         trade_anchors = [
             "trade in", "trade-in", "tradein", "trade:",
-            "trade allowance", "trade value", "allowance",
+            "trade allowance", "trade value",
             "payoff", "lien payoff", "net trade",
             "trade difference", "equity"
         ]
@@ -1937,8 +1949,12 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
         # If explicit fields present, we already populated values above
         
         allowance_keywords = [
-            "trade allowance", "allowance", "trade value",
+            "trade allowance", "trade value",
             "trade-in value", "trade in value", "trade:"
+        ]
+
+        down_payment_markers = [
+            "down payment", "downpayment", "cash down", "total downpayment"
         ]
         
         for keyword in allowance_keywords:
@@ -1948,6 +1964,9 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                 
                 match = re.search(money_pattern, snippet)
                 if match:
+                    snippet_lower = snippet.lower()
+                    if any(marker in snippet_lower for marker in down_payment_markers):
+                        continue
                     amount_str = match.group(1).replace(',', '')
                     try:
                         trade_allowance = float(amount_str)

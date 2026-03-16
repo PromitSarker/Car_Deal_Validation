@@ -15,250 +15,367 @@ class OCRExtractor:
     
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = "gpt-4o"  # Use gpt-4-vision or gpt-4o
+        self.model = os.getenv("OCR_MODEL", "gpt-4o")
         self.api_url = "https://api.openai.com/v1/chat/completions"
     
     async def extract_quote_data(self, files: List[UploadFile]) -> Dict:
         """Extract all quote/contract data using ChatGPT Vision"""
         base64_images = await self._convert_to_base64(files)
-        
-        # Extract raw text using PyMuPDF for PDFs
-        extracted_raw = await self._extract_raw_text_pymupdf(files)
-        
-        # Then extract structured data using Vision API
+
+        # Extract per-page raw text using PyMuPDF for PDFs (images return empty strings — that's OK)
+        page_texts = await self._extract_raw_text_pymupdf(files)
+        full_raw_text = "\n\n--- PAGE BREAK ---\n\n".join(t for t in page_texts if t.strip())
+
+        # Extract structured data using Vision API
         system_prompt = self._get_quote_extraction_prompt()
         response = await self._call_gpt_vision(base64_images, system_prompt)
         parsed = self._parse_response(response)
-        
+
         # Merge raw text into parsed response
         if "extracted_text" in parsed:
-            parsed["extracted_text"]["raw_text"] = extracted_raw
-        
+            parsed["extracted_text"]["raw_text"] = full_raw_text
+            parsed["extracted_text"]["page_texts"] = page_texts
+        else:
+            parsed["extracted_text"] = {
+                "raw_text": full_raw_text,
+                "page_texts": page_texts,
+                "sections": {}
+            }
+
+        # Strip fields that are no longer part of the response contract
+        _remove_keys = {"co_buyer_info", "signatures", "quality_assessment", "extracted_text"}
+        for k in _remove_keys:
+            parsed.pop(k, None)
+        _vd = parsed.get("vehicle_details")
+        if isinstance(_vd, dict):
+            for k in ("trim", "stock_number", "color", "odometer", "mpg_city", "mpg_highway", "transmission"):
+                _vd.pop(k, None)
+
         return parsed
     
-    async def _extract_raw_text_pymupdf(self, files: List[UploadFile]) -> str:
-        """Extract raw text from PDF files using PyMuPDF"""
-        all_text = []
-        
+    async def _extract_raw_text_pymupdf(self, files: List[UploadFile]) -> List[str]:
+        """Extract per-page raw text from PDF files using PyMuPDF"""
+        page_texts = []
+
         for file in files:
             contents = await file.read()
-            
+
             try:
-                # Try to open as PDF
                 pdf_document = fitz.open(stream=contents, filetype="pdf")
-                
                 for page_num in range(len(pdf_document)):
                     page = pdf_document[page_num]
                     text = page.get_text()
-                    all_text.append(text)
-                
+                    page_texts.append(text)
                 pdf_document.close()
             except Exception as e:
-                # If PDF extraction fails, log and continue
                 print(f"Warning: Could not extract text from {file.filename}: {str(e)}")
-            
+
             await file.seek(0)
-        
-        return "\n\n--- PAGE BREAK ---\n\n".join(all_text)
+
+        return page_texts
     
     def _get_quote_extraction_prompt(self) -> str:
-        """System prompt for quote extraction with comprehensive document handling"""
+        """Comprehensive system prompt — extract every visible field from any auto document."""
         return """
-You are an expert automotive document OCR specialist with 10+ years of experience. Your job is to extract ALL data from ANY automotive document type (quote, contract, lease, purchase agreement) with 99% accuracy.
+You are an elite automotive document OCR and data extraction specialist. Extract EVERY structured data field visible on the document into a precise JSON response.
 
-**DOCUMENT TYPES YOU WILL PROCESS:**
-1. Retail Purchase Agreements (e.g., "RETAIL PURCHASE AGREEMENT")
-2. Sales Quotes (e.g., "2025 Nissan Frontier" with financing options)
-3. Installment Sales Contracts (e.g., LAW 553-TX-ARB-e)
-4. Lease Agreements
-5. Trade-In Appraisals
+═══════════════════════════════════════════
+CARDINAL RULES
+═══════════════════════════════════════════
+1. NEVER invent or guess values. Extract only what is explicitly visible.
+2. NEVER omit a field from the JSON schema — use null if not found.
+3. NEVER copy a value from one field to fill a different field.
+4. Extract every line item, every fee, every charge, every named clause.
+5. Preserve exact spelling, capitalization, and formatting of names/addresses.
+6. Numeric fields: strip "$" and commas → number. "$67,158.60" → 67158.60.
+7. Return ONLY valid JSON — no markdown, no code fences, no explanations.
+8. Do NOT reproduce verbatim legal text in any field — use short descriptive values only.
 
-**CRITICAL INSTRUCTIONS:**
-1. You MUST identify the document type first: Quote|Contract|Lease|Purchase Agreement
-2. For EVERY field, you MUST find the EXACT source location
-3. If a field is present but not extractable (blurry/obscured), mark as null with note in quality_assessment
-4. NEVER invent values - only extract what is explicitly visible
-5. Handle multi-page documents as a single entity
+═══════════════════════════════════════════
+DOCUMENT TYPE
+═══════════════════════════════════════════
+- "RETAIL PURCHASE AGREEMENT" → Purchase Agreement
+- "MOTOR VEHICLE RETAIL INSTALLMENT SALES CONTRACT" → Contract
+- Multi-column financing options → Quote
+- "LEASE" / "Lease Agreement" → Lease
 
-**ENHANCED FIELD EXTRACTION GUIDANCE:**
+═══════════════════════════════════════════
+CRITICAL PRICE FIELD RULES
+═══════════════════════════════════════════
+vehicle_details.sale_price:
+  ✓ LAW 553: "Cash Price" on line 1 of the Itemization of Amount Financed section
+       → This is itemization.cash_price_including_accessories. Copy the SAME number to sale_price.
+  ✓ Purchase Agreements: "TOTAL SELLING PRICE" or "CASH PRICE OF VEHICLE"
+  ✓ Quotes: "Selling Price" next to vehicle description
+  ✗ NEVER use "Total Sale Price" from the TILA box (→ tila_disclosures.total_sale_price only)
+  ✗ NEVER use "Amount Financed" as sale_price
 
-1. **Document Type Identification:**
-   - "RETAIL PURCHASE AGREEMENT" = Purchase Agreement
-   - "MOTOR VEHICLE RETAIL INSTALLMENT SALES CONTRACT" = Contract
-   - "2025 Nissan Frontier" quote = Quote
-   - "LEASE" or "Lease Agreement" = Lease
+  ⚠ SELF-CHECK (mandatory before returning JSON):
+     If vehicle_details.sale_price == tila_disclosures.amount_financed → YOU ARE WRONG.
+     A deal with trade-in, fees, and backend products will ALWAYS have:
+       amount_financed > cash_price (sale_price)
+     Re-read line 1 of the Itemization section. That dollar amount is sale_price.
+     sale_price must also equal itemization_of_amount_financed.cash_price_including_accessories.
 
-2. **MSRP (vehicle_details.msrp):**
-   - Look for: "MSRP", "MSRP/Retail", "Manufacturer's Suggested Retail Price", "Sticker Price"
-   - Example: In 2025 Frontier quote: "$39,925.00" (MSRP/Retail)
-   - Example: In Retail Purchase Agreement: "$26,449.85" (CASH PRICE OF VEHICLE)
-   - Convert to number: remove $ and commas (39925.00)
+vehicle_details.msrp:
+  ✓ Only if document explicitly labels "MSRP", "MSRP/Retail", "Sticker Price"
+  ✗ If no MSRP label found → null
 
-3. **Sale Price (vehicle_details.sale_price):**
-   - Look for: "Selling Price", "Total Selling Price", "Total Sale Price"
-   - Example: In Retail Purchase Agreement: "$31,375.85" (TOTAL SELLING PRICE)
-   - Example: In 2025 Frontier quote: "$36,925.00" (Selling Price)
-   - Convert to number: remove $ and commas (36925.00)
+═══════════════════════════════════════════
+VEHICLE YEAR/MAKE/MODEL — PURCHASED vs TRADE-IN
+═══════════════════════════════════════════
+vehicle_details (year/make/model/vin/condition) = the VEHICLE BEING PURCHASED:
+  ✓ Read from the "VEHICLE IDENTIFICATION" table on page 1 (YEAR / MAKE / MODEL / VIN columns)
+  ✗ NEVER use the trade-in vehicle's year/make/model for vehicle_details
 
-4. **Vehicle Identification:**
-   - VIN: Look for "VIN", "VIN/SERIAL NO.", "VEHICLE IDENTIFICATION NUMBER"
-   - Year: Look for "YEAR" or "Model Year"
-   - Make: Look for "MAKE" or "Manufacturer"
-   - Model: Look for "MODEL" or "Vehicle Model"
+trade_in (year/make/model/vin) = the vehicle being traded in:
+  ✓ Read from the "Trade-in: Make / Model / Year / VIN" line below the vehicle table
+  These will often be different vehicles (e.g., purchased = 2025, trade-in = 2023)
+  ✗ NEVER map "Down Payment" / "Total Downpayment" values into any trade_in fields
 
-5. **Trade-In Information:**
-   - Look for: "TRADE-IN", "TRADE-IN ALLOWANCE", "Gross Trade-In"
-   - Example: In Retail Purchase Agreement: "$11,500.00" (LESS: TRADE-IN ALLOWANCE)
-   - Example: In 2025 Frontier quote: "$28,500.00" (Trade Allowance)
-   - Extract both allowance amount and any trade-in vehicle details
+═══════════════════════════════════════════
+FINANCIAL_TERMS CROSS-POPULATION (REQUIRED)
+═══════════════════════════════════════════
+Do NOT leave financial_terms fields null when the value exists elsewhere in the document.
+Apply these mandatory mappings:
+  financial_terms.cash_price         = itemization_of_amount_financed.cash_price_including_accessories
+                                       (= vehicle_details.sale_price)
+  financial_terms.unpaid_balance_of_cash_price = itemization_of_amount_financed.unpaid_balance_of_cash_price
+  financial_terms.total_downpayment  = itemization_of_amount_financed.total_downpayment
+  financial_terms.loan_amount        = tila_disclosures.amount_financed
+                                       (= itemization_of_amount_financed.amount_financed)
+  financial_terms.amount_financed_line5 = itemization_of_amount_financed.amount_financed
+  financial_terms.total_other_charges = itemization_of_amount_financed.total_other_charges_and_paid_to_others
+  financial_terms.apr                = tila_disclosures.annual_percentage_rate
+  financial_terms.finance_charge     = tila_disclosures.finance_charge
+  financial_terms.term_months        = payment_schedule.number_of_payments
+  financial_terms.monthly_payment    = payment_schedule.payment_amount
+  financial_terms.manufacturers_rebate = itemization_of_amount_financed.manufacturers_rebate
+  financial_terms.doc_fee            = fees_breakdown.documentary_fee
+  financial_terms.sales_tax          = extract from line 1 sub-field "SALES TAX $___" in the Cash Price line
+  financial_terms.trade_in_value     = trade_in.gross_trade_in
 
-6. **Financial Terms:**
-   - Down Payment: Look for "Down Payment", "$ Down", "Cash Down"
-   - Monthly Payment: Look for "Est. $/Monthly", "Monthly Payment"
-   - APR: Look for "ANNUAL PERCENTAGE RATE", "% APR", "Interest Rate"
-   - Term: Look for "60 Months", "72 Months", etc.
-   - Loan Amount: Look for "Amount Financed", "Loan Amount"
+═══════════════════════════════════════════
+DOCUMENT-SPECIFIC FIELD MAPPING
+═══════════════════════════════════════════
+LAW 553 Contract:
+  "Cash Price" line 1 → sale_price + itemization.cash_price_including_accessories
+  "Gross Trade-In" → trade_in.gross_trade_in
+  "Pay Off Made By Seller to [lender]" → trade_in.trade_payoff + trade_in.payoff_to_lender
+  "Cash Paid to Buyer for Trade-In" → trade_in.cash_paid_to_buyer
+  "Net Trade Allowance" → trade_in.net_trade_allowance
+  "Manufacturers Rebate" → financial_terms.manufacturers_rebate
+  "Total Downpayment" line 2 → financial_terms.total_downpayment
+  "Unpaid Balance of Cash Price" line 3 → itemization.unpaid_balance_of_cash_price
+  Section 4 rows A-O → itemization.other_charges[] each with label/description/amount
+  Line 4 total → itemization.total_other_charges_and_paid_to_others
+  Line 5 "Amount Financed" → itemization.amount_financed + financial_terms.loan_amount
+  TILA box 5 fields → tila_disclosures.*
+  Payment rows → payment_schedule.*
+  "Late Charge" clause → financial_terms.late_charge_days + financial_terms.late_charge_rate
+  "Returned Payment Charge $__" → legal_clauses.returned_payment_charge (number only)
+  Arbitration checkbox/provision → legal_clauses.arbitration_provision (true/false)
+  Vehicle checkboxes NEW/USED/DEMO → vehicle_details.condition
+  Use checkboxes PERSONAL/BUSINESS → vehicle_details.use_purpose
+  Form number e.g. "LAW 553-TX-ARB-e 3/25" → document_metadata.form_number
+  OCCC notice lender name + phone → lender_info.lender_name + lender_info.lender_phone
+  OCCC address → lender_info.lender_address
 
-7. **Fees and Add-ons:**
-   - Document Fee: Look for "Documentary Fee", "Doc Fee"
-   - Title Fee: Look for "Title Fee", "Title & Registration"
-   - Registration Fee: Look for "Registration Fee", "State Registration"
-   - Add-ons: Extract each item in "OPTIONAL ACCESSORIES", "Add-ons", etc.
+Retail Purchase Agreement:
+  "CASH PRICE OF VEHICLE" or "TOTAL SELLING PRICE" → sale_price
+  "LESS: TRADE-IN ALLOWANCE" → trade_in.gross_trade_in
+  "PAY OFF AMOUNT" → trade_in.trade_payoff
+  Accessory lines → addons_and_packages[]
 
-**JSON SCHEMA (MUST RETURN EXACTLY THIS STRUCTURE):**
+Sales Quote (multi-column):
+  "MSRP/Retail" → msrp
+  "Selling Price" → sale_price
+  "Trade Allowance" → trade_in.gross_trade_in
+  "Trade Payoff" / "Payoff" / "Amount Owed" → trade_in.trade_payoff
+  "Trade Difference" (if explicitly shown) → map by sign:
+    - If labeled as negative/owed/over-allowance, treat as negative equity amount
+    - If labeled as credit/equity/under-allowance, treat as positive equity amount
+    - If sign context is unclear, do not infer sign from the number alone
+  "Amount Financed" → financial_terms.loan_amount
+  Selected term → payment_schedule.*
 
+QUOTE TRADE EXTRACTION SAFETY RULES (MANDATORY):
+  - Trade Allowance = dealership value offered for the trade vehicle.
+  - Trade Payoff = amount owed on the trade vehicle loan/lien.
+  - Trade equity relationship:
+      equity = trade_allowance - trade_payoff
+      negative_equity = max(0, trade_payoff - trade_allowance)
+  - NEVER use "Cash Down", "Down Payment", or payment-option column headers/values
+    as trade allowance, trade payoff, or trade difference.
+  - If a quote table has multiple "Cash Down" options (e.g., 8000 / 12000 / 15000),
+    those values belong only to down payment context, not trade context.
+
+═══════════════════════════════════════════
+JSON SCHEMA
+═══════════════════════════════════════════
 {
-  "quote_type": "Quote|Contract|Lease|Purchase Agreement",
+  "document_metadata": {
+    "form_number": null,
+    "document_title": null,
+    "document_date": null,
+    "quote_type": null
+  },
   "buyer_info": {
-    "name": "string|null",
-    "phone": "string|null",
-    "email": "string|null",
-    "address": "string|null"
+    "name": null,
+    "address": null,
+    "city": null,
+    "state": null,
+    "zip": null,
+    "phone": null,
+    "email": null
   },
   "dealer_info": {
-    "name": "string|null",
-    "phone": "string|null",
-    "email": "string|null",
-    "address": "string|null",
-    "city": "string|null",
-    "state": "string|null",
-    "zip": "string|null"
+    "name": null,
+    "address": null,
+    "city": null,
+    "state": null,
+    "zip": null,
+    "phone": null,
+    "email": null
   },
   "vehicle_details": {
-    "year": "number|null",
-    "make": "string|null",
-    "model": "string|null",
-    "trim": "string|null",
-    "vin": "string|null",
-    "msrp": "number|null",
-    "sale_price": "number|null",
-    "odometer": "number|null",
-    "color": "string|null",
-    "mpg_city": "number|null",
-    "mpg_highway": "number|null",
-    "transmission": "string|null"
+    "year": null,
+    "make": null,
+    "model": null,
+    "vin": null,
+    "condition": null,
+    "use_purpose": null,
+    "msrp": null,
+    "sale_price": null
+  },
+  "trade_in": {
+    "year": null,
+    "make": null,
+    "model": null,
+    "vin": null,
+    "license_number": null,
+    "odometer": null,
+    "gross_trade_in": null,
+    "payoff_to_lender": null,
+    "trade_payoff": null,
+    "cash_paid_to_buyer": null,
+    "net_trade_allowance": null
+  },
+  "tila_disclosures": {
+    "annual_percentage_rate": null,
+    "finance_charge": null,
+    "amount_financed": null,
+    "total_of_payments": null,
+    "total_sale_price": null,
+    "down_payment_tila": null
+  },
+  "payment_schedule": {
+    "number_of_payments": null,
+    "payment_amount": null,
+    "first_payment_date": null,
+    "final_payment_amount": null,
+    "final_payment_date": null,
+    "payment_frequency": null
   },
   "financial_terms": {
-    "down_payment": "number|null",
-    "trade_in_value": "number|null",
-    "loan_amount": "number|null",
-    "apr": "number|null",
-    "term_months": "number|null",
-    "monthly_payment": "number|null",
-    "total_interest": "number|null",
-    "doc_fee": "number|null",
-    "title_fee": "number|null",
-    "registration_fee": "number|null",
-    "sales_tax": "number|null",
-    "sales_tax_rate": "number|null"
+    "cash_price": null,
+    "unpaid_balance_of_cash_price": null,
+    "total_downpayment": null,
+    "down_payment": null,
+    "manufacturers_rebate": null,
+    "trade_in_value": null,
+    "loan_amount": null,
+    "amount_financed_line5": null,
+    "total_other_charges": null,
+    "apr": null,
+    "term_months": null,
+    "monthly_payment": null,
+    "total_interest": null,
+    "finance_charge": null,
+    "doc_fee": null,
+    "title_fee": null,
+    "registration_fee": null,
+    "sales_tax": null,
+    "sales_tax_rate": null,
+    "late_charge_days": null,
+    "late_charge_rate": null,
+    "prepayment_penalty": null
   },
-  "addons_and_packages": [
-    {
-      "name": "string",
-      "price": "number",
-      "category": "GAP|VSC|Warranty|Appearance|Maintenance|Paint|Interior|Tint|Wheel|Other"
-    }
-  ],
+  "itemization_of_amount_financed": {
+    "cash_price_including_accessories": null,
+    "sales_tax_on_cash_price": null,
+    "gross_trade_in": null,
+    "payoff_by_seller": null,
+    "cash_paid_to_buyer_for_trade": null,
+    "net_trade_allowance": null,
+    "manufacturers_rebate": null,
+    "other_credits": [],
+    "total_downpayment": null,
+    "unpaid_balance_of_cash_price": null,
+    "other_charges": [],
+    "total_other_charges_and_paid_to_others": null,
+    "amount_financed": null
+  },
+  "fees_breakdown": {
+    "road_and_bridge_fee": null,
+    "temporary_tag_fee": null,
+    "state_inspection_fee": null,
+    "vehicle_emissions_fee": null,
+    "deputy_service_fee": null,
+    "dealer_inventory_tax": null,
+    "sales_tax": null,
+    "government_license_registration": null,
+    "government_certificate_of_title": null,
+    "vehicle_inspection_program_fee": null,
+    "documentary_fee": null,
+    "debt_cancellation_fee": null,
+    "other_fees": []
+  },
+  "addons_and_packages": [],
   "lease_specific": {
-    "money_factor": "number|null",
-    "residual_value": "number|null",
-    "residual_percent": "number|null",
-    "annual_miles": "number|null",
-    "excess_mile_fee": "number|null",
-    "acquisition_fee": "number|null",
-    "disposition_fee": "number|null",
-    "cap_cost": "number|null",
-    "cap_cost_reduction": "number|null",
-    "drive_off_total": "number|null"
+    "money_factor": null,
+    "residual_value": null,
+    "residual_percent": null,
+    "annual_miles": null,
+    "excess_mile_fee": null,
+    "acquisition_fee": null,
+    "disposition_fee": null,
+    "cap_cost": null,
+    "cap_cost_reduction": null,
+    "drive_off_total": null
   },
-  "extracted_text": {
-    "raw_text": "Complete extracted text from document",
-    "sections": {
-      "header": "string|null",
-      "vehicle_section": "string|null",
-      "financial_section": "string|null",
-      "addons_section": "string|null",
-      "terms_and_conditions": "string|null",
-      "signature_section": "string|null"
-    }
+  "lender_info": {
+    "lender_name": null,
+    "lender_phone": null,
+    "lender_address": null
   },
-  "quality_assessment": {
-    "extraction_confidence": 0-100,
-    "image_quality": "Good|Fair|Poor",
-    "missing_fields": ["list of fields not found"],
-    "notes": "Any relevant observations about the document"
-  }
+  "legal_clauses": {
+    "arbitration_provision": null,
+    "returned_payment_charge": null,
+    "liability_insurance_present": null,
+    "security_interest_present": null,
+    "prepayment_penalty_present": null,
+    "late_charge_present": null
+  },
 }
 
-**EXTRACTION PROCESS:**
-1. First, identify the document type and structure
-2. For each field:
-   a. Search for ALL possible labels/locations
-   b. Verify the value context matches the field
-   c. Extract the raw value
-   d. Convert to proper data type
-3. For multi-option documents (e.g., multiple financing terms):
-   - Extract the most relevant option (e.g., 60 months if selected)
-   - Note other options in quality_assessment if needed
-4. For numeric fields:
-   - Remove all non-numeric characters except decimal point
-   - Convert to number (not string)
-   - Example: "$67,158.60" → 67158.60
+═══════════════════════════════════════════
+ARRAY ITEM STRUCTURES
+═══════════════════════════════════════════
+itemization_of_amount_financed.other_charges:
+  { "label": "A", "description": "Net trade-in payoff to NMAC", "amount": 12039.44 }
 
-**DOCUMENT-SPECIFIC GUIDANCE:**
+itemization_of_amount_financed.other_credits:
+  { "description": "Manufacturer Rebate", "amount": 1208.90 }
 
-1. For Retail Purchase Agreements (like first sample):
-   - "CASH PRICE OF VEHICLE" = MSRP
-   - "TOTAL SELLING PRICE" = Sale Price
-   - "LESS: TRADE-IN ALLOWANCE" = Trade-in Value
-   - "PAY OFF AMOUNT" = Loan Payoff
-   - "LIFETIME TINT", "NITRO", etc. = Add-ons
+fees_breakdown.other_fees:
+  { "description": "Plate Transfer Fee", "paid_to": "State", "amount": null }
 
-2. For Sales Quotes (like second sample):
-   - "MSRP/Retail" = MSRP
-   - "Selling Price" = Sale Price
-   - "Trade Allowance" = Trade-in Value
-   - "Amount Financed" = Loan Amount
-   - Multiple payment columns: extract the selected term
+addons_and_packages:
+  { "name": "SERVICE CONTRACT", "price": 2000.00, "paid_to": "NESNA", "category": "GAP|VSC|Service Contract|Warranty|Maintenance|Appearance|Paint|Interior|Tint|Wheel|Other" }
 
-3. For Contracts (LAW 553):
-   - "Cash Price" (page 2) = MSRP
-   - "Total Sale Price" (page 1) = Sale Price
-   - "Gross Trade-In" = Trade-in Value
-   - "Amount Financed" = Loan Amount
-
-**FINAL RULES:**
-- Return ONLY valid JSON, no markdown, no explanations
-- If a field is not found, use null (do NOT omit the field)
-- For multi-page documents, consolidate all data into single JSON
-- In quality_assessment:
-  * List ALL missing fields by name
-  * Note any conflicts between pages
-  * Rate confidence based on clarity of source
-- Preserve exact spelling of names and addresses
-- For numeric fields: 0 is valid, null means not found
-- If you cannot find a value after thorough search, set to null
-- For documents with multiple financing options, select the most relevant one (e.g., 60 months) and note others in quality_assessment
+legal_clauses boolean fields: use true if clause is present on document, false if explicitly absent, null if not determinable.
+legal_clauses.returned_payment_charge: extract as number (e.g. 30), not text.
 """
     
     async def _convert_to_base64(self, files: List[UploadFile]) -> List[str]:
@@ -277,10 +394,9 @@ You are an expert automotive document OCR specialist with 10+ years of experienc
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        
-        # Build content with images
-        content = [{"type": "text", "text": system_prompt}]
-        
+
+        # Build user content with all images
+        content = []
         for base64_image in base64_images:
             content.append({
                 "type": "image_url",
@@ -289,13 +405,17 @@ You are an expert automotive document OCR specialist with 10+ years of experienc
                     "detail": "high"
                 }
             })
-        
+        content.append({
+            "type": "text",
+            "text": "Extract every field and all text from this document following the instructions exactly. Return only valid JSON."
+        })
+
         payload = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are an expert automotive document OCR specialist with 10+ years of experience in vehicle sales documents."
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -303,34 +423,58 @@ You are an expert automotive document OCR specialist with 10+ years of experienc
                 }
             ],
             "temperature": 0,
-            "max_tokens": 4000
+            "max_tokens": 16384,
+            "response_format": {"type": "json_object"}
         }
-        
+
         try:
             response = requests.post(
                 self.api_url,
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=180
             )
             response.raise_for_status()
-            return response.json()
+            raw = response.json()
+            # Warn if the model hit the token limit (response is truncated)
+            finish_reason = raw.get("choices", [{}])[0].get("finish_reason", "")
+            if finish_reason == "length":
+                raise RuntimeError(
+                    "Extraction response was truncated (max_tokens reached). "
+                    "The document may be too large. Try splitting into fewer pages per request."
+                )
+            return raw
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"OpenAI Vision API error: {str(e)}")
     
     def _parse_response(self, response: dict) -> dict:
-        """Parse ChatGPT Vision response"""
+        """Parse ChatGPT Vision response — response_format:json_object guarantees valid JSON"""
         try:
             content = response["choices"][0]["message"]["content"]
-            
-            # Extract JSON from response
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
-            
-            if json_start >= 0 and json_end > json_start:
-                json_str = content[json_start:json_end]
-                return json.loads(json_str)
-            else:
-                raise ValueError("No JSON found in response")
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            raise RuntimeError(f"Failed to parse Vision API response: {str(e)}")
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"Unexpected API response structure: {str(e)}")
+
+        # Primary parse — response_format:json_object should always be valid JSON
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as primary_err:
+            pass
+
+        # Fallback: strip any accidental markdown fences and retry
+        try:
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except json.JSONDecodeError as fallback_err:
+            raise RuntimeError(
+                f"Could not parse model response as JSON. "
+                f"The response may have been truncated or malformed. "
+                f"Parse error: {fallback_err}. "
+                f"Response preview: {content[:300]!r}"
+            )
+
+        raise RuntimeError(
+            f"No valid JSON found in model response. "
+            f"Response preview: {content[:300]!r}"
+        )

@@ -213,6 +213,29 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
         or vehicle_section.get("sale_price")
         or vehicle_section.get("selling_price")
     )
+
+    # Guard: if sale_price == amount_financed it was mis-extracted from the TILA box.
+    # Fall back to itemization cash_price_including_accessories which is the true vehicle price.
+    _amount_financed_check = _safe_float(
+        _pick_first(flat, "amount_financed", "loan_amount")
+        or (data.get("tila_disclosures") or {}).get("amount_financed")
+        or (data.get("itemization_of_amount_financed") or {}).get("amount_financed")
+    )
+    _cash_price_fallback = _safe_float(
+        _pick_first(flat, "cash_price", "cash_price_including_accessories")
+        or (data.get("itemization_of_amount_financed") or {}).get("cash_price_including_accessories")
+        or (data.get("financial_terms") or {}).get("cash_price")
+    )
+    if (
+        selling_price is not None
+        and _amount_financed_check is not None
+        and abs(selling_price - _amount_financed_check) < 0.02
+        and _cash_price_fallback is not None
+        and _cash_price_fallback < _amount_financed_check
+    ):
+        # sale_price was incorrectly set to amount_financed — use the itemization cash price
+        selling_price = _cash_price_fallback
+
     parsed["selling_price"] = selling_price
     parsed["sale_price"] = selling_price
 
@@ -227,20 +250,67 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
     if total_fees is None:
         total_fees = _sum_fees(flat)
 
+    # Supplement amount_financed from tila/itemization if still missing
+    if amount_financed is None:
+        _tila_af = data.get("tila_disclosures") or {}
+        _item_af = data.get("itemization_of_amount_financed") or {}
+        _ft_af = data.get("financial_terms") or {}
+        amount_financed = _safe_float(
+            _tila_af.get("amount_financed")
+            or _item_af.get("amount_financed")
+            or _ft_af.get("loan_amount")
+        )
+
+    # Supplement trade_in_value from trade_in section if missing
+    if trade_in_value is None:
+        _ti = data.get("trade_in") or {}
+        trade_in_value = _safe_float(
+            _ti.get("gross_trade_in")
+            or _ti.get("net_trade_allowance")
+        )
+
+    # Supplement sales tax from financial_terms or fees_breakdown
+    if total_taxes is None:
+        _fb = data.get("fees_breakdown") or {}
+        _ft2 = data.get("financial_terms") or {}
+        total_taxes = _safe_float(
+            _ft2.get("sales_tax")
+            or _fb.get("sales_tax")
+        )
+
+    # Supplement doc_fee from fees_breakdown
+    _doc_fee = _safe_float(
+        _pick_first(flat, "doc_fee", "documentary_fee")
+        or (data.get("fees_breakdown") or {}).get("documentary_fee")
+        or (data.get("financial_terms") or {}).get("doc_fee")
+    )
+
     parsed["normalized_pricing"] = {
         "msrp": msrp,
         "selling_price": selling_price,
         "discount": _safe_float(_pick_first(flat, "discount", "total_discount")),
-        "rebate": _safe_float(_pick_first(flat, "rebate", "total_rebate")),
+        "rebate": _safe_float(_pick_first(flat, "rebate", "total_rebate",
+                                         "manufacturers_rebate")
+                   or (data.get("itemization_of_amount_financed") or {}).get("manufacturers_rebate")
+                   or (data.get("financial_terms") or {}).get("manufacturers_rebate")),
         "down_payment": down_payment,
         "trade_in_value": trade_in_value,
         "amount_financed": amount_financed,
         "total_fees": total_fees,
         "total_taxes": total_taxes,
+        "doc_fee": _doc_fee,
     }
 
     # ─── APR Data ───
-    apr_rate = _safe_float(_pick_first(flat, "apr", "interest_rate", "rate", "APR"))
+    # Check tila_disclosures and financial_terms as additional sources
+    _tila = data.get("tila_disclosures") or {}
+    _ft = data.get("financial_terms") or {}
+    _ps = data.get("payment_schedule") or {}
+    apr_rate = _safe_float(
+        _pick_first(flat, "apr", "interest_rate", "rate", "APR")
+        or _tila.get("annual_percentage_rate")
+        or _ft.get("apr")
+    )
     money_factor = _safe_float(_pick_first(flat, "money_factor", "mf", "lease_rate"))
     parsed["apr"] = {
         "rate": apr_rate,
@@ -253,10 +323,21 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
         parsed["money_factor"] = money_factor
 
     # ─── Term Data ───
-    term_months = _safe_int(_pick_first(flat, "term_months", "term", "months", "loan_term", "lease_term"))
+    term_months = _safe_int(
+        _pick_first(flat, "term_months", "term", "months", "loan_term", "lease_term")
+        or _ps.get("number_of_payments")
+        or _ft.get("term_months")
+    )
     parsed["term"] = {
         "months": term_months,
     }
+
+    # ─── Monthly Payment ───
+    parsed["monthly_payment"] = _safe_float(
+        _pick_first(flat, "monthly_payment", "payment_amount", "payment")
+        or _ps.get("payment_amount")
+        or _ft.get("monthly_payment")
+    )
 
     # ─── Lease Specific ───
     cap_cost = _safe_float(_pick_first(flat, "cap_cost", "capitalized_cost", "gross_cap_cost"))
@@ -270,7 +351,11 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
     parsed["annual_miles"] = annual_miles
 
     # Lender info (for captive lender detection)
-    parsed["lessor_name"] = _pick_first(flat, "lessor_name", "lessor", "lender_name", "lender", "finance_company")
+    _lender_section = data.get("lender_info") or {}
+    parsed["lessor_name"] = (
+        _pick_first(flat, "lessor_name", "lessor", "lender_name", "lender", "finance_company")
+        or _lender_section.get("lender_name")
+    )
     parsed["lender_name"] = parsed["lessor_name"]
 
     # Rent charge for MF derivation
@@ -306,7 +391,9 @@ def convert_extracted_json_to_parsed(data: dict) -> dict:
         # Check if trade data is passed as a dict at root level
         trade_obj = data.get("trade") or data.get("trade_data") or data.get("trade_info")
         if isinstance(trade_obj, dict) and any(trade_obj.get(k) for k in ("trade_allowance", "trade_in_value", "trade_value")):
-            ta = _safe_float(_pick_first(trade_obj, "trade_allowance", "trade_in_value", "trade_value", "allowance"))
+            # IMPORTANT: do not use generic "allowance" key here.
+            # Some payloads use "allowance" for down payment or unrelated incentives.
+            ta = _safe_float(_pick_first(trade_obj, "trade_allowance", "trade_in_value", "trade_value"))
             tp = _safe_float(_pick_first(trade_obj, "trade_payoff", "payoff", "payoff_amount"))
             eq = _safe_float(trade_obj.get("equity"))
             ne = _safe_float(trade_obj.get("negative_equity"))

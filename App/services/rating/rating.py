@@ -4,6 +4,7 @@ from App.services.rate_helper.discount_detector import DiscountDetector
 from App.services.rate_helper.discount_schema import DiscountLineItem, DiscountTotals
 from typing import List, Optional, Dict
 import os
+import re
 import base64
 import json
 
@@ -155,9 +156,9 @@ Your task is to evaluate transparency, disclosure clarity, and structure risk fo
    ❌ Total of Payments
    ❌ Any value that includes taxes, fees, or backend products
 
-**For this contract example:**
-- selling_price = $52,068.78 (vehicle cash price before taxes/fees)
-- NOT $67,158.60 (that's Amount Financed including taxes/fees/products)
+**Example (for illustration only — always extract from the actual document):**
+- selling_price = Cash Price from itemization (vehicle cash price before backend products)
+- NOT the Amount Financed from the Truth-in-Lending box (that includes taxes, fees, trade payoff, and backend products)
 
 ### TOTAL SALE PRICE & AMOUNT FINANCED RESOLUTION (INTERNAL USE ONLY)
 
@@ -201,6 +202,14 @@ Apply these deductions for transparency violations:
 - Add-ons not clearly labeled (grouped/unclear): -10 points
 - Pack/Addendum without itemization (hidden bundle): -5 points
 - "Other fees" without breakdown (hidden bucket): -5 points
+
+### DOCUMENTATION FEE THRESHOLDS
+NEVER invent a doc fee penalty. Use ONLY these thresholds:
+- Doc fee > $899: RED flag, -3 points ("Excessive Doc Fee")
+- Doc fee > $599 AND ≤ $899: RED flag, -2 points ("High Doc Fee")
+- Doc fee ≤ $599: NO flag, NO penalty — this is an acceptable/low doc fee
+- NEVER apply more than -3 points for a doc fee regardless of amount
+- A doc fee of $225, $300, $400, $500 etc. is LOW and does NOT trigger any penalty
 
 ### FRONT-END ADD-ON LOAD (QUOTE MODE)
 Calculate total front-end add-ons and apply:
@@ -246,9 +255,9 @@ B. APR Risk Penalties:
 - APR > 20%: -10 points
 
 C. APR Bonuses (Dealer-Disclosed Only):
-- APR < 10% AND APR > 0%: +5 points bonus
+- APR = 0.00%: +5 points bonus (exceptional manufacturer or dealer-subvented rate — best possible financing)
 - APR < 5% AND APR > 0%: +10 points bonus
-- APR = 0.00%: NO BONUS (manufacturer-subvented rate; neutral)
+- APR < 10% AND APR > 0%: +5 points bonus
 - No bonus if APR is estimated
 ❌ No APR penalties if backend inclusion makes validation unsafe
 
@@ -278,13 +287,15 @@ Each flag MUST be a JSON object with these fields:
 }
 ```
 
-**GREEN FLAGS - Generate when positive aspects are found:**
-- Transparent itemization: All fees and products clearly listed
-- Competitive APR: Rate below market average
-- Reasonable fees: Documentation fees within acceptable range
-- Fair pricing: Products priced appropriately
-- Positive trade equity: Trade value exceeds payoff
-- Clear disclosure: All terms clearly presented
+**GREEN FLAGS - Generate when positive aspects are found (include `bonus` field with the value below):**
+- Transparent itemization — all fees and products clearly listed: `bonus: 5`
+- Competitive APR — rate below market average (APR < 10% > 0%): `bonus: 5`; (APR < 5% > 0%): `bonus: 10`; (APR = 0%): `bonus: 5`
+- Reasonable fees — all documentation fees within acceptable range (≤ $599): `bonus: 2`
+- Fair pricing — selling price at or below MSRP: `bonus: 3`
+- Positive trade equity — trade allowance exceeds payoff: `bonus: 3`
+- Clear disclosure — all terms clearly presented with no bundling: `bonus: 3`
+- Backend properly disclosed — all backend products individually itemized with prices: `bonus: 3`
+- NEVER assign `bonus: 0` or `bonus: null` to a green flag — every green flag MUST have a positive bonus value.
 
 **RED FLAGS - Generate for issues and violations:**
 - Poor transparency: Missing itemization or bundled items
@@ -326,6 +337,12 @@ trade_allowance = deal_data.get('trade_allowance', 0)
 trade_payoff = deal_data.get('trade_payoff', 0)
 negative_equity = max(0, trade_payoff - trade_allowance)
 
+Authoritative trade definitions (QUOTE MODE):
+- trade_allowance = dealership value offered for the trade-in vehicle
+- trade_payoff = amount owed / lien payoff on the trade-in vehicle
+- trade_difference (if shown on document) = equity or negative equity depending label/sign context
+- NEVER treat "Cash Down" / "Down Payment" values as trade_allowance, trade_payoff, or trade_difference
+
 structural_adjustment = 0
 if negative_equity > 5000:
     structural_adjustment = -10
@@ -334,6 +351,12 @@ elif negative_equity > 1000:
 
 Apply after base score calculation. Label as "Structure Risk Adjustment" - not a dealer behavior penalty.
 UI messaging: "Rolled negative equity increases the amount financed and overall loan risk. This adjustment reflects structure risk — not dealer behavior."
+
+**CRITICAL NEGATIVE EQUITY FLAG RULES:**
+- The negative equity itself (trade payoff > allowance) → MUST be a **BLUE** advisory flag with `deduction: 0` and `bonus: null`. It is NEVER a red flag.
+- The structural score adjustment → MUST be encoded as a **RED** flag with `item: "Structure Risk"` and the computed `deduction` value (5 or 10). Use the message: "Structure Risk Adjustment: Rolled negative equity of $[amount] increases total loan exposure — this is a structure risk adjustment, not a dealer behavior penalty."
+- Do NOT output the structural adjustment as a deduction:0 flag — it MUST have the real deduction value.
+- NEVER create a green flag for "positive trade equity" when trade payoff > trade allowance.
 
 ### NARRATIVE REQUIREMENTS
 All narratives must use "SmartBuyer Score" not "Trust Score" in Quote Mode.
@@ -368,6 +391,8 @@ If trade information is present:
 - If payoff > allowance: "Negative equity of $[amount] rolled into new loan"
 - If allowance > payoff: "Positive equity of $[amount] applied to purchase"
 - If allowance = payoff: "Trade equity neutral"
+- Use exact math: negative equity = payoff - allowance (only when payoff > allowance)
+- Do not use down-payment figures when computing trade amounts
 
 If no trade information is found in the document:
 - State: "No trade identified."
@@ -866,7 +891,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
         # Step A: Trade Anchors - Check if ANY anchor exists
         trade_anchors = [
             "trade in", "trade-in", "tradein", "trade:",
-            "trade allowance", "trade value", "allowance",
+            "trade allowance", "trade value",
             "payoff", "lien payoff", "net trade",
             "trade difference", "equity"
         ]
@@ -881,7 +906,10 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             narrative_lower = narrative_trade.lower()
             money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
 
-            if trade_allowance is None and "allowance" in narrative_lower:
+            if trade_allowance is None and (
+                "trade allowance" in narrative_lower
+                or ("allowance" in narrative_lower and "trade" in narrative_lower)
+            ):
                 match = re.search(money_pattern, narrative_trade)
                 if match:
                     trade_allowance = _coerce_float(match.group(1))
@@ -897,8 +925,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                     negative_equity_amount = _coerce_float(match.group(1))
         
         # Step B & C: Extract money values near trade keywords
-        import re
-        
+
         # Money pattern: $12,345.67 or 12345.67 or 12,345
         money_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
         
@@ -906,8 +933,12 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
         
         # Allowance keywords (priority order)
         allowance_keywords = [
-            "trade allowance", "allowance", "trade value",
+            "trade allowance", "trade value",
             "trade-in value", "trade in value", "trade:"
+        ]
+
+        down_payment_markers = [
+            "down payment", "downpayment", "cash down", "total downpayment"
         ]
         
         for keyword in allowance_keywords:
@@ -919,6 +950,9 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                 # Find first money value in snippet
                 match = re.search(money_pattern, snippet)
                 if match:
+                    snippet_lower = snippet.lower()
+                    if any(marker in snippet_lower for marker in down_payment_markers):
+                        continue
                     amount_str = match.group(1).replace(',', '')
                     try:
                         trade_allowance = float(amount_str)
@@ -1021,24 +1055,46 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                 should_use_ai = not parsed.get("has_precomputed_flags", False)
                 if should_use_ai:
                     print("JSON path: calling AI for full prompt-based analysis...")
-                    # Pass the ORIGINAL raw data so AI sees real values (apr, msrp, fees etc.)
-                    # not the abstracted converter output
-                    api_response = self._call_json_analysis_api(parsed_data, language)
+                    # ── Save FULL converter output before AI overwrites parsed ──
+                    # The converter has authoritative structured data (APR, pricing,
+                    # term, trade, doc_fee) that Python audit flags depend on.
+                    _converter_parsed = dict(parsed)
+
+                    # Build a corrected copy of raw data so the AI also sees the right price.
+                    _corrected_selling_price = _converter_parsed.get("selling_price")
+                    _ai_input = dict(parsed_data)
+                    if _corrected_selling_price is not None:
+                        _ai_input["selling_price"] = _corrected_selling_price
+                        _ai_input["sale_price"] = _corrected_selling_price
+                        if isinstance(_ai_input.get("vehicle_details"), dict):
+                            _ai_input["vehicle_details"] = dict(_ai_input["vehicle_details"])
+                            _ai_input["vehicle_details"]["sale_price"] = _corrected_selling_price
+                            _ai_input["vehicle_details"]["selling_price"] = _corrected_selling_price
+
+                    api_response = self._call_json_analysis_api(_ai_input, language)
                     ai_result = self._parse_api_response(api_response)
+
                     # AI result is now the primary parsed — preserve key identity fields from converter
                     for k in ("buyer_name", "dealer_name", "logo_text", "email",
                               "phone_number", "address", "state", "region", "vin_number", "date"):
-                        if not ai_result.get(k) and parsed.get(k):
-                            ai_result[k] = parsed[k]
-                    # Preserve trade dict from converter if AI didn't extract it
-                    if not ai_result.get("trade") and parsed.get("trade"):
-                        ai_result["trade"] = parsed["trade"]
-                    # Do NOT use AI's score field — AI flags contain correct deductions/bonuses,
-                    # Python will compute the final score from those flags below.
+                        if not ai_result.get(k) and _converter_parsed.get(k):
+                            ai_result[k] = _converter_parsed[k]
+
+                    # ── Restore converter's structured data for Python audit flags ──
+                    # AI provides narrative text and flag messages (display), but Python
+                    # is the SOLE authority for scoring. These fields must come from the
+                    # converter so Python audit checks fire correctly.
+                    for _restore_key in ("selling_price", "sale_price", "normalized_pricing",
+                                         "apr", "term", "trade", "doc_fee", "line_items"):
+                        _cv = _converter_parsed.get(_restore_key)
+                        if _cv is not None:
+                            ai_result[_restore_key] = _cv
+
+                    # Do NOT use AI's score field — Python recomputes from audit flags.
                     ai_result.pop("score", None)
-                    # Mark: audit merge and narrative call should be skipped
+                    # Mark that AI provided flags (used to zero out AI flag deduction/bonus
+                    # values below so only Python audit flags drive scoring).
                     ai_result["has_precomputed_flags"] = True
-                    ai_result["_ai_narrative_done"] = True
                     parsed = ai_result
             elif base64_images is None:
                 validated_files = await self._validate_files(files)
@@ -1148,34 +1204,43 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             apr_data = parsed.get("apr", {})
             if isinstance(apr_data, dict):
                 apr_rate = apr_data.get("rate")
+                # Also check "listed" key (AI schema uses "listed" instead of "rate")
+                if apr_rate is None:
+                    apr_rate = apr_data.get("listed")
                 try:
                     if apr_rate is not None:
                         apr_f = float(apr_rate)
-                        if apr_f > 0:
-                            if apr_f <= 4.9:
-                                audit_flags.append(AuditFlag(
-                                    type="green", category="Excellent APR",
-                                    message=f"APR of {apr_f:.2f}% is excellent — well below market average.",
-                                    item="APR", deduction=None, bonus=5
-                                ))
-                            elif apr_f <= 6.9:
-                                audit_flags.append(AuditFlag(
-                                    type="green", category="Good APR",
-                                    message=f"APR of {apr_f:.2f}% is competitive.",
-                                    item="APR", deduction=None, bonus=2
-                                ))
-                            elif apr_f >= 16.0:
-                                audit_flags.append(AuditFlag(
-                                    type="red", category="Predatory APR",
-                                    message=f"APR of {apr_f:.2f}% is predatory and significantly above market rates.",
-                                    item="APR", deduction=10, bonus=None
-                                ))
-                            elif apr_f > 12.0:
-                                audit_flags.append(AuditFlag(
-                                    type="red", category="High APR",
-                                    message=f"APR of {apr_f:.2f}% exceeds typical market rates.",
-                                    item="APR", deduction=5, bonus=None
-                                ))
+                        if apr_f == 0.0:
+                            # 0% APR — exceptional financing, +5 bonus
+                            audit_flags.append(AuditFlag(
+                                type="green", category="0% APR",
+                                message="APR of 0.00% is the best possible financing — zero interest charges.",
+                                item="APR", deduction=None, bonus=5
+                            ))
+                        elif apr_f <= 4.9:
+                            audit_flags.append(AuditFlag(
+                                type="green", category="Excellent APR",
+                                message=f"APR of {apr_f:.2f}% is excellent — well below market average.",
+                                item="APR", deduction=None, bonus=5
+                            ))
+                        elif apr_f <= 6.9:
+                            audit_flags.append(AuditFlag(
+                                type="green", category="Good APR",
+                                message=f"APR of {apr_f:.2f}% is competitive.",
+                                item="APR", deduction=None, bonus=2
+                            ))
+                        elif apr_f > 12.0 and apr_f < 16.0:
+                            audit_flags.append(AuditFlag(
+                                type="red", category="High APR",
+                                message=f"APR of {apr_f:.2f}% exceeds typical market rates.",
+                                item="APR", deduction=5, bonus=None
+                            ))
+                        elif apr_f >= 16.0:
+                            audit_flags.append(AuditFlag(
+                                type="red", category="Predatory APR",
+                                message=f"APR of {apr_f:.2f}% is predatory and significantly above market rates.",
+                                item="APR", deduction=10, bonus=None
+                            ))
                 except (ValueError, TypeError):
                     pass
 
@@ -1195,6 +1260,14 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                         except (ValueError, TypeError):
                             pass
                         break
+            # Fallback: check normalized_pricing.doc_fee
+            if doc_fee is None:
+                _np_doc = (parsed.get("normalized_pricing") or {}).get("doc_fee") if isinstance(parsed.get("normalized_pricing"), dict) else None
+                if _np_doc is not None:
+                    try:
+                        doc_fee = abs(float(str(_np_doc).replace(",", "").replace("$", "")))
+                    except (ValueError, TypeError):
+                        pass
             if doc_fee is not None:
                 if doc_fee > 899:
                     audit_flags.append(AuditFlag(
@@ -1279,8 +1352,9 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             # Step 6.5: Process Trade Data (UPDATED - Use OCR-based extraction)
             trade_data = self._extract_trade_data(parsed)
             
-            # Add negative equity flag if applicable
+            # Add negative equity flags if applicable
             if trade_data.negative_equity and trade_data.negative_equity > 0:
+                # Blue advisory flag (no score impact)
                 neg_equity_flag = AuditFlag(
                     type="blue",
                     category="Negative Equity Alert",
@@ -1290,6 +1364,23 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                     bonus=None
                 )
                 audit_flags.append(neg_equity_flag)
+
+                # Structural adjustment — RED flag with real deduction (per system prompt rules)
+                if trade_data.negative_equity > 5000:
+                    _ne_deduction = 10
+                elif trade_data.negative_equity > 1000:
+                    _ne_deduction = 5
+                else:
+                    _ne_deduction = 0
+                if _ne_deduction > 0:
+                    audit_flags.append(AuditFlag(
+                        type="red",
+                        category="Structure Risk Adjustment",
+                        message=f"Rolled negative equity of ${trade_data.negative_equity:,.2f} increases the amount financed and overall loan risk. This is a structure risk adjustment, not a dealer behavior penalty.",
+                        item="Structure Risk",
+                        deduction=_ne_deduction,
+                        bonus=None
+                    ))
             
             # Step 7: Suppress "missing incentive" warnings if Finance Certificate detected
             if finance_certs:
@@ -1337,30 +1428,50 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             green_flags = parse_flags(parsed.get("green_flags", []))
             blue_flags = parse_flags(parsed.get("blue_flags", []))
 
-            # Only merge Python audit flags when no pre-existing flags were supplied.
-            # If the input already has flags (from a prior OCR/AI analysis), skip the
-            # audit merge — the pre-existing flags ARE the authoritative analysis.
             has_precomputed = parsed.get("has_precomputed_flags", False)
-            if not has_precomputed:
-                for audit_flag in audit_flags:
-                    flag_obj = Flag(
-                        type=audit_flag.type,
-                        message=audit_flag.message,
-                        item=audit_flag.item,
-                        deduction=audit_flag.deduction,
-                        bonus=audit_flag.bonus
-                    )
-                    if audit_flag.type == "red":
-                        red_flags.append(flag_obj)
-                    elif audit_flag.type == "green":
-                        green_flags.append(flag_obj)
-                    elif audit_flag.type == "blue":
-                        blue_flags.append(flag_obj)
 
-            print(f"Python flags - Red: {len(red_flags)}, Green: {len(green_flags)}, Blue: {len(blue_flags)}")
+            # When AI generated the flags (JSON path), their deduction/bonus values
+            # are unreliable (AI often returns 0). Zero them out — Python audit flags
+            # are the SOLE scoring authority.
+            if has_precomputed:
+                red_flags = [
+                    Flag(type=f.type, message=f.message, item=f.item, deduction=None, bonus=f.bonus)
+                    for f in red_flags
+                ]
+                green_flags = [
+                    Flag(type=f.type, message=f.message, item=f.item, deduction=f.deduction, bonus=None)
+                    for f in green_flags
+                ]
+                print(f"AI flags zeroed — Red: {len(red_flags)}, Green: {len(green_flags)}, Blue: {len(blue_flags)}")
 
-            # Score — always compute from flags (AI returns correct deductions/bonuses in flags,
-            # but its 'score' field is unreliable and ignored)
+            # ALWAYS merge Python audit flags — they have correct deduction/bonus values
+            # computed from the actual deal data (APR, doc fee, LTV, MSRP, trade, etc.).
+            for audit_flag in audit_flags:
+                flag_obj = Flag(
+                    type=audit_flag.type,
+                    message=audit_flag.message,
+                    item=audit_flag.item,
+                    deduction=audit_flag.deduction,
+                    bonus=audit_flag.bonus
+                )
+                if audit_flag.type == "red":
+                    red_flags.append(flag_obj)
+                elif audit_flag.type == "green":
+                    green_flags.append(flag_obj)
+                elif audit_flag.type == "blue":
+                    blue_flags.append(flag_obj)
+
+            print(f"Final flags (AI + Python audit) — Red: {len(red_flags)}, Green: {len(green_flags)}, Blue: {len(blue_flags)}")
+
+            # ── Remove suppressed flag categories from display and scoring ──
+            _suppressed = {"poor transparency", "high documentation fee", "excessive doc fee",
+                           "soft - high doc fee", "high doc fee"}
+            def _is_suppressed(f):
+                return (f.type or "").lower() in _suppressed or (getattr(f, "item", "") or "").lower() == "doc fee"
+            red_flags = [f for f in red_flags if not _is_suppressed(f)]
+            green_flags = [f for f in green_flags if not _is_suppressed(f)]
+
+            # Score — always compute from flags (Python audit flags are the scoring authority)
             if parsed.get("_ai_score") is not None:
                 # Legacy pre-existing flags path (score was explicitly set)
                 adjusted_score = max(0.0, min(100.0, float(parsed["_ai_score"])))
@@ -1373,9 +1484,28 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                 for f in green_flags:
                     if f.bonus is not None:
                         adjusted_score += abs(float(f.bonus))
-                if not has_precomputed:
-                    adjusted_score += total_audit_penalty
-                adjusted_score = max(0.0, min(100.0, adjusted_score))
+                adjusted_score += total_audit_penalty
+                print(f"Score before ceilings: {adjusted_score}")
+
+                # ── Score Ceilings (credibility guards from system prompt) ──
+                _has_negative_equity = (trade_data and trade_data.negative_equity
+                                        and trade_data.negative_equity > 0)
+                _term = None
+                _term_data = parsed.get("term")
+                if isinstance(_term_data, dict):
+                    _term = _term_data.get("months")
+                elif hasattr(_term_data, "months"):
+                    _term = _term_data.months
+
+                if _has_negative_equity and adjusted_score > 95:
+                    print(f"Ceiling applied: negative equity → max 95 (was {adjusted_score})")
+                    adjusted_score = 95.0
+                if _term and int(_term) >= 72 and adjusted_score > 95:
+                    print(f"Ceiling applied: term >= 72 → max 95 (was {adjusted_score})")
+                    adjusted_score = 95.0
+
+                # Hard ceiling: 95 is the maximum possible score
+                adjusted_score = max(0.0, min(95.0, adjusted_score))
             print(f"Score Calculation: Final={adjusted_score}")
 
             # Translate flags to requested language (no scoring changes)
