@@ -955,6 +955,14 @@ Authoritative trade definitions:
 
 ### If no trade:
 - State: "No trade identified."
+- If the trade section shows "N/A", blank, or not present, set:
+    - `trade.trade_allowance = null`
+    - `trade.trade_payoff = null`
+    - `trade.equity = null`
+    - `trade.negative_equity = null`
+    - `trade.status = "No trade identified"`
+- NEVER infer trade from these fields alone: "Cash Down", "Down Payment", "Deposit", "Cash on Delivery", "Unpaid Balance", or similarly named payment fields.
+- If trade fields are null, do NOT create negative-equity flags or trade-equity bonuses.
 
 **This section CANNOT be omitted.**
 
@@ -1928,12 +1936,27 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
         
         trade_anchors = [
             "trade in", "trade-in", "tradein", "trade:",
-            "trade allowance", "trade value",
-            "payoff", "lien payoff", "net trade",
-            "trade difference", "equity"
+            "trade allowance", "trade value", "trade difference",
+            "net trade", "trade payoff", "trade-in payoff"
         ]
-        
+
+        no_trade_markers = [
+            "trade in n/a", "trade-in n/a", "trade n/a", "trade: n/a",
+            "trade allowance n/a", "trade value n/a", "trade payoff n/a",
+            "description of trade-in 1 n/a", "description of trade-in 2 n/a"
+        ]
+
         trade_anchor_found = any(anchor in page_text for anchor in trade_anchors)
+        explicit_no_trade = any(marker in page_text for marker in no_trade_markers)
+
+        if explicit_no_trade and not any(v is not None for v in (trade_allowance, trade_payoff, equity, negative_equity_amount)):
+            return TradeData(
+                trade_allowance=None,
+                trade_payoff=None,
+                equity=None,
+                negative_equity=None,
+                status="No trade identified"
+            )
         
         if not trade_anchor_found:
             return TradeData(
@@ -1975,22 +1998,23 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
                         continue
         
         payoff_keywords = [
-            "payoff", "lien payoff", "loan payoff", "balance owed"
+            "trade payoff", "trade-in payoff", "lien payoff", "loan payoff"
         ]
-        
-        for keyword in payoff_keywords:
-            if keyword in page_text:
-                idx = page_text.find(keyword)
-                snippet = page_text[idx:idx+100]
-                
-                match = re.search(money_pattern, snippet)
-                if match:
-                    amount_str = match.group(1).replace(',', '')
-                    try:
-                        trade_payoff = float(amount_str)
-                        break
-                    except ValueError:
-                        continue
+
+        if trade_anchor_found:
+            for keyword in payoff_keywords:
+                if keyword in page_text:
+                    idx = page_text.find(keyword)
+                    snippet = page_text[idx:idx+100]
+
+                    match = re.search(money_pattern, snippet)
+                    if match:
+                        amount_str = match.group(1).replace(',', '')
+                        try:
+                            trade_payoff = float(amount_str)
+                            break
+                        except ValueError:
+                            continue
         
         trade_status = "No trade identified"
         
@@ -1998,8 +2022,7 @@ Return ONLY valid JSON matching the exact output schema. No markdown, no explana
             trade_allowance is not None or
             trade_payoff is not None or
             equity is not None or
-            negative_equity_amount is not None or
-            trade_anchor_found
+            negative_equity_amount is not None
         )
         
         if not trade_present:
