@@ -8,55 +8,31 @@ router = APIRouter(prefix="/api", tags=["extraction"])
 extractor = OCRExtractor()
 gemini_extractor = GeminiExtractor()
 
+# @router.post("/extract_quote_vision", operation_id="extract_quote_data_vision")
+# async def extract_quote_vision(
+#     files: List[UploadFile] = File(..., description="Upload quote/contract images (jpg, png, pdf)")
+# ):
+#     """
+#     Extract quote/contract data using ChatGPT Vision OCR.
+#     ...
+#     """
+#     if not files:
+#         raise HTTPException(status_code=400, detail="No files provided")
+#
+#     try:
+#         result = await extractor.extract_quote_data(files)
+#         return result
+#     except Exception as e:
+#         ...
+#         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+
 @router.post("/extract_quote_vision", operation_id="extract_quote_data_vision")
 async def extract_quote_vision(
     files: List[UploadFile] = File(..., description="Upload quote/contract images (jpg, png, pdf)")
 ):
     """
-    Extract quote/contract data using ChatGPT Vision OCR.
-
-    Returns:
-    - Buyer info (name, phone, email, address)
-    - Co-buyer info
-    - Dealer info (name, location, contact)
-    - Vehicle details (VIN, year, make, model, MSRP, sale price, condition, use purpose)
-    - Trade-in details (year/make/model/VIN, allowance, payoff, net trade)
-    - TILA disclosures (APR, Finance Charge, Amount Financed, Total of Payments, Total Sale Price)
-    - Payment schedule (number, amount, due dates)
-    - Full itemization of amount financed (lines 1-5 with all sub-items)
-    - Complete fees breakdown (A through N/O rows)
-    - Addons/packages (GAP, VSC, warranties, service contracts, etc.)
-    - Lease-specific data (money factor, residual, acquisition fees)
-    - Lender info and OCCC notice
-    - Legal clauses (arbitration, returned payment, liability, etc.)
-    - Signatures
-    - Raw extracted text per page and verbatim sections
-    - Quality assessment
-
-    Files: Multiple quote/contract images (jpg, png, pdf)
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided")
-
-    try:
-        result = await extractor.extract_quote_data(files)
-        return result
-    except RuntimeError as e:
-        tb = traceback.format_exc()
-        print(f"[extract_quote_vision] RuntimeError:\n{tb}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[extract_quote_vision] Unexpected error:\n{tb}")
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
-
-@router.post("/extract_quote_gemini", operation_id="extract_quote_data_gemini")
-async def extract_quote_gemini(
-    files: List[UploadFile] = File(..., description="Upload quote/contract images (jpg, png, pdf)")
-):
-    """
-    Extract quote/contract data using Gemini 2.5/3.0.
-    Identical interface to extract_quote_vision.
+    Extract quote/contract data using Gemini 2.0 Flash.
+    Now the primary extraction endpoint.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -66,9 +42,9 @@ async def extract_quote_gemini(
         return result
     except RuntimeError as e:
         tb = traceback.format_exc()
-        print(f"[extract_quote_gemini] RuntimeError:\n{tb}")
+        print(f"[extract_quote_vision_gemini] RuntimeError:\n{tb}")
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[extract_quote_gemini] Unexpected error:\n{tb}")
+        print(f"[extract_quote_vision_gemini] Unexpected error:\n{tb}")
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
