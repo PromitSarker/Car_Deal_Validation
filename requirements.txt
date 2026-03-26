@@ -10,3 +10,4 @@ img2pdf
 openai
 pymupdf
 cachetools
+google-genai
